@@ -47,6 +47,7 @@
 #include "db/wal_manager.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "memtable/wbwi_memtable.h"
 #include "monitoring/instrumented_mutex.h"

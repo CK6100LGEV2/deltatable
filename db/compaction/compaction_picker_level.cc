@@ -70,6 +70,8 @@ class LevelCompactionBuilder {
         ioptions_(ioptions),
         mutable_db_options_(mutable_db_options) {}
 
+
+  bool LevelCompactionBuilder::PickSmartL0ToL1Compaction();
   // Pick and return a compaction.
   Compaction* PickCompaction();
 
@@ -506,7 +508,207 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
   return true;
 }
 
+struct L0CandidateScore {
+  FileMetaData* file;
+  int index;
+  uint64_t l1_overlap_bytes;
+  double score; // 分数越高优先级越高
+};
+
+// 智能 L0->L1 Picker
+// 目标：在控制写放大的前提下，优先回收老数据
+bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
+  // 0. 环境准备与依赖获取
+  const auto* icmp = vstorage_->InternalComparator(); // 修复 icmp_ 未定义问题
+  const auto& l0_files = vstorage_->LevelFiles(0);
+  const int target_level = 1;
+  
+  // 触发条件检查：如果 L0 文件数不足，不进行 Smart Picking
+  if (l0_files.size() < mutable_cf_options_.level0_file_num_compaction_trigger) {
+    return false;
+  }
+
+  uint64_t current_time = ioptions_.env->NowMicros() / 1000000;
+
+  // 定义候选评分结构 (局部定义，保证即插即用)
+  struct Candidate {
+    FileMetaData* file;
+    size_t index;
+    uint64_t l1_overlap_bytes;
+    double score; // 分数越高优先级越高
+  };
+
+  std::vector<Candidate> candidates;
+  candidates.reserve(l0_files.size());
+
+  // 1. 遍历所有 L0 文件进行评分
+  for (size_t i = 0; i < l0_files.size(); ++i) {
+    FileMetaData* f = l0_files[i];
+    if (f->being_compacted) continue;
+
+    // A. 计算与 L1 的重叠大小 (Cost)
+    // GetOverlappingInputs 会找到 L1 中与 f 有重叠的所有文件
+    std::vector<FileMetaData*> l1_overlaps;
+    vstorage_->GetOverlappingInputs(target_level, &f->smallest, &f->largest, &l1_overlaps);
+    
+    uint64_t overlap_bytes = 0;
+    for (const auto* l1_f : l1_overlaps) {
+      overlap_bytes += l1_f->fd.GetFileSize();
+    }
+
+    // B. Trivial Move 检测 (最高优先级：零写放大)
+    // 如果 L1 没有重叠文件，直接移动，这是最优解
+    if (overlap_bytes == 0) {
+      start_level_inputs_.level = 0;
+      start_level_inputs_.files.clear();
+      start_level_inputs_.files.push_back(f);
+      output_level_ = target_level;
+      
+      compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+      ROCKS_LOG_BUFFER(log_buffer_, "[Delta-Smart] Picked Trivial Move: File %" PRIu64, f->fd.GetNumber());
+      return true;
+    }
+
+    // C. 计算写放大效率 (Efficiency Factor)
+    // 效率 = 自身大小 / (自身大小 + 重叠大小)
+    // 范围 (0, 1]。越接近 1，说明重叠越少，合并越划算。
+    double self_size = static_cast<double>(f->fd.GetFileSize());
+    double total_io = self_size + static_cast<double>(overlap_bytes);
+    double efficiency = self_size / total_io;
+
+    // D. 计算年龄权重 (Age Factor - GC Benefit)
+    // 越老的文件，包含“逻辑删除”数据的概率越高。我们希望给老文件加权。
+    // 假设：每存活 1 小时，权重增加 0.1，上限 2.0 倍。
+    uint64_t age_seconds = (current_time > f->file_creation_time) 
+                           ? (current_time - f->file_creation_time) : 0;
+    double age_hours = static_cast<double>(age_seconds) / 3600.0;
+    // 权重曲线：1.0 (新文件) -> 2.0 (10小时以上的老文件)
+    double age_factor = 1.0 + std::min(1.0, age_hours * 0.1);
+
+    // E. 最终得分
+    double final_score = efficiency * age_factor;
+
+    candidates.push_back({f, i, overlap_bytes, final_score});
+  }
+
+  // 如果没有可用的候选文件
+  if (candidates.empty()) return false;
+
+  // 2. 选择得分最高的“最佳文件”
+  // 使用 std::max_element 避免全量排序，效率更高
+  auto best_it = std::max_element(candidates.begin(), candidates.end(), 
+      [](const Candidate& a, const Candidate& b) {
+          return a.score < b.score;
+      });
+  const Candidate& best = *best_it;
+
+  // 3. 碎片聚合 (Expansion / Batching)
+  // 为了减少 L0 文件数，尝试“顺便”带上其他 L0 文件。
+  // 原则：只要其他 L0 文件完全落在 "Best文件的 L1 重叠范围" 内，带上它们就不会增加 L1 层的读开销。
+  
+  start_level_inputs_.level = 0;
+  start_level_inputs_.files.clear();
+  output_level_ = target_level;
+
+  // 3.1 确定 L1 侧的边界 [boundary_min, boundary_max]
+  // 我们需要手动计算 overlaps 的边界，替代 GetRange 辅助函数
+  InternalKey boundary_min, boundary_max;
+  {
+    std::vector<FileMetaData*> best_l1_overlaps;
+    vstorage_->GetOverlappingInputs(target_level, &best.file->smallest, &best.file->largest, &best_l1_overlaps);
+    
+    if (!best_l1_overlaps.empty()) {
+      boundary_min = best_l1_overlaps[0]->smallest;
+      boundary_max = best_l1_overlaps[0]->largest;
+      for (const auto* l1_f : best_l1_overlaps) {
+        if (icmp->Compare(l1_f->smallest, boundary_min) < 0) boundary_min = l1_f->smallest;
+        if (icmp->Compare(l1_f->largest, boundary_max) > 0) boundary_max = l1_f->largest;
+      }
+    } else {
+      // 理论上不可能进入这里，因为前面 Trivial Move 已经处理了 overlap=0 的情况
+      // 但为了健壮性，如果没有 overlap，边界就是文件自身
+      boundary_min = best.file->smallest;
+      boundary_max = best.file->largest;
+    }
+  }
+
+  // 3.2 贪心扩展：遍历所有 L0 文件，寻找“顺路车”
+  // 注意：为了保持 Input Files 的某种顺序性（虽然 L0 是重叠的），我们通常按列表顺序添加
+  // 也可以只扩展相邻索引，但全量扫描 L0 寻找“包围在内”的文件收益更高
+  
+  // 先加入 Best 文件
+  std::vector<FileMetaData*> picked_files;
+  picked_files.push_back(best.file);
+
+  for (size_t i = 0; i < l0_files.size(); ++i) {
+    FileMetaData* f = l0_files[i];
+    if (f == best.file || f->being_compacted) continue;
+
+    // 检查是否完全包含在 L1 边界内
+    // Condition: f->smallest >= boundary_min AND f->largest <= boundary_max
+    if (icmp->Compare(f->smallest, boundary_min) >= 0 && 
+        icmp->Compare(f->largest, boundary_max) <= 0) {
+        picked_files.push_back(f);
+    }
+  }
+
+  // 4. 将结果填入 start_level_inputs_
+  // RocksDB 要求 input files 按某种顺序排列（通常不需要严格排序，但保持稳定较好）
+  // 这里我们简单地将收集到的文件加入
+  for (auto* f : picked_files) {
+      start_level_inputs_.files.push_back(f);
+  }
+
+  compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+  
+  ROCKS_LOG_BUFFER(log_buffer_, 
+      "[Delta-Smart] Picked L0->L1. BestFile: %" PRIu64 " (Score %.2f), Total Inputs: %zu", 
+      best.file->fd.GetNumber(), best.score, start_level_inputs_.size());
+
+  return true;
+}
+
 Compaction* LevelCompactionBuilder::PickCompaction() {
+  // 1. 优先尝试我们的 Smart L0->L1 Picker
+  if (PickSmartL0ToL1Compaction()) {
+      // 必须在这里设置好其他必要的参数
+      // 因为我们跳过了 SetupInitialFiles，所以需要手动确保状态正确
+      // 但 SetupOtherInputsIfNeeded 还是需要的，用来拉取 L1 的重叠文件
+      if (!SetupOtherInputsIfNeeded()) {
+          // 如果 L1 选取失败（罕见），回退
+          start_level_inputs_.clear();
+      } else {
+          // 成功构建
+          Compaction* c = GetCompaction();
+          TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+          return c;
+      }
+  }
+
+  // 2. 如果 Smart Picker 没选中（例如文件数不够，或都在忙），
+  //    回退到 RocksDB 原生逻辑作为保底
+  SetupInitialFiles();
+  if (start_level_inputs_.empty()) {
+    return nullptr;
+  }
+  assert(start_level_ >= 0 && output_level_ >= 0);
+
+  if (!SetupOtherL0FilesIfNeeded()) {
+    return nullptr;
+  }
+  if (!SetupOtherInputsIfNeeded()) {
+    return nullptr;
+  }
+
+  Compaction* c = GetCompaction();
+
+  TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+
+  return c;
+}
+
+
+/*Compaction* LevelCompactionBuilder::PickCompaction() {
   // Pick up the first file to start compaction. It may have been extended
   // to a clean cut.
   SetupInitialFiles();
@@ -514,6 +716,9 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
     return nullptr;
   }
   assert(start_level_ >= 0 && output_level_ >= 0);
+
+  // 原来的逻辑
+  SetupInitialFiles();
 
   // If it is a L0 -> base level compaction, we need to set up other L0
   // files if needed.
@@ -533,7 +738,7 @@ Compaction* LevelCompactionBuilder::PickCompaction() {
   TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
 
   return c;
-}
+}*/
 
 Compaction* LevelCompactionBuilder::GetCompaction() {
   // TryPickL0TrivialMove() does not apply to the case when compacting L0 to an

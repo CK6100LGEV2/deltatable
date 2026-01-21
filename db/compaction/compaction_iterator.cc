@@ -447,6 +447,36 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
   return true;
 }
 
+// for delta
+void CompactionIterator::CheckHotspotFilters() {
+  if (!hotspot_manager_) return;
+
+  // 1. 提取当前 Key 的 CUID
+  uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
+
+  if (cuid == current_cuid_ && cuid != 0) {
+    return;
+  }
+
+  current_cuid_ = cuid;
+  skip_current_cuid_ = false;
+  if (cuid == 0) return;
+
+  if (involved_cuids_) {
+      involved_cuids_->insert(cuid);
+  }
+
+  // c)	当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
+  // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
+  // 
+  if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
+    skip_current_cuid_ = true;
+    // hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_); 防止 compaction 失败
+    return; 
+  }
+
+}
+
 void CompactionIterator::NextFromInput() {
   at_next_ = false;
   validity_info_.Invalidate();

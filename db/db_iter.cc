@@ -510,6 +510,36 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
             }
 
             valid_ = true;
+            // for delta
+            if (hotspot_manager_) {
+              uint64_t cuid = hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
+              if (cuid != 0) {
+                  // 如果 CUID 已被删除，跳过
+                  if (hotspot_manager_->IsCuidDeleted(cuid)) {
+                    valid_ = false;
+                    ResetValueAndColumns(); // 这个函数用于清理 value_
+                    // RecordTick(statistics_, DELTA_LOGICAL_DELETE_SKIPPED);
+                    iter_.Next();
+                    continue;
+                  }
+
+                  uint64_t phys_id = GetCurrentPhysUnitId(iter_.iter());
+              
+                  // 如果切换了 CUID，清空已访问集合[建立在 cuid 递增]
+                  if (delta_ctx_.last_cuid != cuid) {
+                      delta_ctx_.last_cuid = cuid;
+                      delta_ctx_.visited_units_for_cuid.clear();
+                  }
+
+                  // 维护引用计数
+                if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                  hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
+                  delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                  // // 记录该 Delta 片段在原始 LSM 中的位置？delta 列表
+                }
+     
+              }
+            }
             return true;
           case kTypeMerge:
             if (!PrepareValueInternal()) {

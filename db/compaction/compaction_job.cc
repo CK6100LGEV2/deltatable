@@ -1467,7 +1467,10 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
 CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
                                   SubcompactionKeyBoundaries& boundaries) {
+  // auto delta_ctx = std::make_shared<DeltaCompactionContext>();
   const CompactionFileOpenFunc open_file_func =
+      [this, sub_compact](CompactionOutputs& outputs) {
+        return this->OpenCompactionOutputFile(sub_compact, outputs);
       [this, sub_compact](CompactionOutputs& outputs) {
         return this->OpenCompactionOutputFile(sub_compact, outputs);
       };
@@ -1476,13 +1479,15 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
       sub_compact->start.has_value() ? &boundaries.start_user_key : nullptr;
   const Slice* end_user_key =
       sub_compact->end.has_value() ? &boundaries.end_user_key : nullptr;
-
+  
   const CompactionFileCloseFunc close_file_func =
+      [this, sub_compact, start_user_key, end_user_key](
       [this, sub_compact, start_user_key, end_user_key](
           const Status& status,
           const ParsedInternalKey& prev_iter_output_internal_key,
           const Slice& next_table_min_key, const CompactionIterator* c_iter,
           CompactionOutputs& outputs) {
+
         return this->FinishCompactionOutputFile(
             status, prev_iter_output_internal_key, next_table_min_key,
             start_user_key, end_user_key, c_iter, sub_compact, outputs);
@@ -1494,6 +1499,7 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
 Status CompactionJob::ProcessKeyValue(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     CompactionIterator* c_iter, const CompactionFileOpenFunc& open_file_func,
+    const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros) {
     const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros) {
   Status status;
   const uint64_t kRecordStatsEvery = 1000;
@@ -2412,6 +2418,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 }
 
 void CompactionJob::CleanupCompaction() {
+
   for (SubcompactionState& sub_compact : compact_->sub_compact_states) {
     sub_compact.Cleanup(table_cache_.get());
   }

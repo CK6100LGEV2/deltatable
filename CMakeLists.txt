@@ -773,6 +773,7 @@ set(SOURCES
         db/write_stall_stats.cc
         db/write_thread.cc
         db_stress_tool/db_stress_compression_manager.cc
+        delta/global_delete_count_table.cc
         env/composite_env.cc
         env/env.cc
         env/env_chroot.cc
