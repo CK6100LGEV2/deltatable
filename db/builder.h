@@ -15,6 +15,7 @@
 #include "db/seqno_to_time_mapping.h"
 #include "db/table_properties_collector.h"
 #include "db/version_set.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "options/cf_options.h"
 #include "rocksdb/comparator.h"

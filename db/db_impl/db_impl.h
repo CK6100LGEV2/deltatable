@@ -459,9 +459,8 @@ class DBImpl : public DB {
 
   using DB::SetOptions;
   Status SetOptions(
-      const std::unordered_map<ColumnFamilyHandle*,
-                               std::unordered_map<std::string, std::string>>&
-          column_families_opts_map) override;
+      ColumnFamilyHandle* column_family,
+      const std::unordered_map<std::string, std::string>& options_map) override;
 
   Status SetDBOptions(
       const std::unordered_map<std::string, std::string>& options_map) override;
@@ -724,7 +723,8 @@ class DBImpl : public DB {
                                       SuperVersion* sv, SequenceNumber snapshot,
                                       ReadCallback* read_callback,
                                       bool expose_blob_index = false,
-                                      bool allow_refresh = true);
+                                      bool allow_refresh = true,
+                                      std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual SequenceNumber GetLastPublishedSequence() const {
     if (last_seq_same_as_publish_seq_) {
@@ -3198,6 +3198,10 @@ class DBImpl : public DB {
   // The number of LockWAL called without matching UnlockWAL call.
   // See also lock_wal_write_token_
   uint32_t lock_wal_count_ = 0;
+  
+  // for delta
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  public: std::shared_ptr<HotspotManager> GetHotspotManager() { return hotspot_manager_; }
 };
 
 class GetWithTimestampReadCallback : public ReadCallback {

@@ -164,6 +164,11 @@ class CompactionOutputs {
   }
 
   bool HasBuilder() const { return builder_ != nullptr; }
+  
+    // for delta
+  TableBuilder* GetBuilder() const { 
+    return builder_.get(); 
+  }
 
   FileMetaData* GetMetaData() { return &current_output().meta; }
 

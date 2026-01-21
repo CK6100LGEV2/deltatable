@@ -15,6 +15,7 @@
 #include "db/snapshot_checker.h"
 #include "db/wide/wide_column_serialization.h"
 #include "db/wide/wide_columns_helper.h"
+#include "delta/hotspot_manager.h"
 #include "logging/logging.h"
 #include "port/likely.h"
 #include "rocksdb/listener.h"
@@ -38,7 +39,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
-    std::optional<SequenceNumber> preserve_seqno_min)
+    std::optional<SequenceNumber> preserve_seqno_min,
+    std::shared_ptr<HotspotManager> hotspot_manager,
+    std::vector<uint64_t> input_file_numbers)
     : CompactionIterator(
           input, cmp, merge_helper, last_sequence, snapshots, earliest_snapshot,
           earliest_write_conflict_snapshot, job_snapshot, snapshot_checker, env,
@@ -47,7 +50,8 @@ CompactionIterator::CompactionIterator(
           manual_compaction_canceled,
           compaction ? std::make_unique<RealCompaction>(compaction) : nullptr,
           must_count_input_entries, compaction_filter, shutting_down, info_log,
-          full_history_ts_low, preserve_seqno_min) {}
+          full_history_ts_low, preserve_seqno_min,
+          hotspot_manager, input_file_numbers) {}
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
@@ -65,7 +69,9 @@ CompactionIterator::CompactionIterator(
     const std::atomic<bool>* shutting_down,
     const std::shared_ptr<Logger> info_log,
     const std::string* full_history_ts_low,
-    std::optional<SequenceNumber> preserve_seqno_min)
+    std::optional<SequenceNumber> preserve_seqno_min,
+    std::shared_ptr<HotspotManager> hotspot_manager,
+    std::vector<uint64_t> input_file_numbers)
     : input_(input, cmp, must_count_input_entries),
       cmp_(cmp),
       merge_helper_(merge_helper),
@@ -104,7 +110,11 @@ CompactionIterator::CompactionIterator(
       current_key_committed_(false),
       cmp_with_history_ts_low_(0),
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
-      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)) {
+      preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)),
+      hotspot_manager_(hotspot_manager), // for delta new Init
+      current_cuid_(0),
+      skip_current_cuid_(false),
+      input_file_numbers_(std::move(input_file_numbers)) {
   assert(snapshots_ != nullptr);
   assert(preserve_seqno_after_ <= earliest_snapshot_);
 
@@ -483,6 +493,17 @@ void CompactionIterator::NextFromInput() {
 
   while (!Valid() && input_.Valid() && !IsPausingManualCompaction() &&
          !IsShuttingDown()) {
+
+    if (hotspot_manager_) {
+        CheckHotspotFilters();
+        // 当前 cuid 是否跳过
+        if (skip_current_cuid_) {
+            iter_stats_.num_record_drop_obsolete++;    
+            // 直接跳过当前 Key
+            input_.Next();
+            continue; 
+        }
+    }
     key_ = input_.key();
     value_ = input_.value();
     blob_value_.Reset();

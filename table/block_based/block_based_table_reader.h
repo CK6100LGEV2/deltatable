@@ -575,8 +575,6 @@ class BlockBasedTable : public TableReader {
   friend class PartitionedFilterBlockReader;
   friend class PartitionedFilterBlockTest;
   friend class DBBasicTest_MultiGetIOBufferOverrun_Test;
-  friend class ReadSet;
-  friend class IODispatcherTest;
 };
 
 // Maintaining state of a two-level iteration on a partitioned index structure.
@@ -602,6 +600,7 @@ struct BlockBasedTable::Rep {
       const BlockBasedTableOptions& _table_opt,
       const InternalKeyComparator& _internal_comparator, bool skip_filters,
       uint64_t _file_size, int _level, const bool _immortal_table,
+      uint64_t _file_number,
       const bool _user_defined_timestamps_persisted = true)
       : ioptions(_ioptions),
         env_options(_env_options),
@@ -618,7 +617,8 @@ struct BlockBasedTable::Rep {
         immortal_table(_immortal_table),
         user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
         fs_prefetch_support(CheckFSFeatureSupport(
-            _ioptions.fs.get(), FSSupportedOps::kFSPrefetch)) {}
+            _ioptions.fs.get(), FSSupportedOps::kFSPrefetch)),
+        file_number(_file_number) {}
   ~Rep() { status.PermitUncheckedError(); }
   const ImmutableOptions& ioptions;
   const EnvOptions& env_options;
@@ -720,6 +720,10 @@ struct BlockBasedTable::Rep {
       table_reader_cache_res_handle = nullptr;
 
   CachableEntry<Block_kUserDefinedIndex> udi_block;
+
+  // for delta
+  // File number of the table.
+  uint64_t file_number;
 
   SequenceNumber get_global_seqno(BlockType block_type) const {
     return (block_type == BlockType::kFilterPartitionIndex ||

@@ -144,7 +144,9 @@ CompactionJob::CompactionJob(
     const std::string& db_id, const std::string& db_session_id,
     std::string full_history_ts_low, std::string trim_ts,
     BlobFileCompletionCallback* blob_callback, int* bg_compaction_scheduled,
-    int* bg_bottom_compaction_scheduled)
+    int* bg_bottom_compaction_scheduled,
+    // for delta
+    std::shared_ptr<HotspotManager> hotspot_manager)
     : compact_(new CompactionState(compaction)),
       internal_stats_(compaction->compaction_reason(), 1),
       db_options_(db_options),
@@ -188,7 +190,9 @@ CompactionJob::CompactionJob(
       blob_callback_(blob_callback),
       extra_num_subcompaction_threads_reserved_(0),
       bg_compaction_scheduled_(bg_compaction_scheduled),
-      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled) {
+      bg_bottom_compaction_scheduled_(bg_bottom_compaction_scheduled),
+      // for delta
+      hotspot_manager_(std::move(hotspot_manager)) {
   assert(job_stats_ != nullptr);
   assert(log_buffer_ != nullptr);
   assert(job_context);
@@ -1443,14 +1447,28 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     InternalIterator* input, const CompactionFilter* compaction_filter,
     MergeHelper& merge, BlobFileResources& blob_resources,
-    const WriteOptions& write_options) {
+    const WriteOptions& write_options,
+    std::unordered_set<uint64_t>* local_involved_cuids) {
   CreateBlobFileBuilder(sub_compact, cfd, blob_resources, write_options);
 
   const std::string* const full_history_ts_low =
       full_history_ts_low_.empty() ? nullptr : &full_history_ts_low_;
   assert(job_context_);
+  // for delta
+  std::vector<uint64_t> input_file_numbers;
+  // Level
+  for (size_t i = 0; i < sub_compact->compaction->num_input_levels(); ++i) {
+      // Files
+      for (const auto& file : *sub_compact->compaction->inputs(i)) {
+          input_file_numbers.push_back(file->fd.GetNumber());
+      }
+  }
 
-  return std::make_unique<CompactionIterator>(
+
+  std::shared_ptr<HotspotManager> hotspot_manager = hotspot_manager_;
+  input_file_numbers_ = input_file_numbers;
+
+  auto c_iter = std::make_unique<CompactionIterator>(
       input, cfd->user_comparator(), &merge, versions_->LastSequence(),
       &(job_context_->snapshot_seqs), earliest_snapshot_,
       job_context_->earliest_write_conflict_snapshot,
@@ -1461,7 +1479,15 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       sub_compact->compaction
           ->DoesInputReferenceBlobFiles() /* must_count_input_entries */,
       sub_compact->compaction, compaction_filter, shutting_down_,
-      db_options_.info_log, full_history_ts_low, preserve_seqno_after_);
+      db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
+      hotspot_manager,
+      input_file_numbers);
+
+  if (c_iter) {
+      c_iter->SetInvolvedCuids(local_involved_cuids);
+  }
+
+  return c_iter;
 }
 
 std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
@@ -1756,6 +1782,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   ReadOptions read_options;
   const WriteOptions write_options(Env::IOPriority::IO_LOW,
                                    Env::IOActivity::kCompaction);
+    // for delta
+  std::unordered_set<uint64_t> local_involved_cuids;
 
   InternalIterator* input_iter = CreateInputIterator(
       sub_compact, cfd, iterators, boundaries, read_options);
@@ -1782,7 +1810,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
   auto c_iter =
       CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter,
-                               merge, blob_resources, write_options);
+                               merge, blob_resources, write_options, &local_involved_cuids);
   assert(c_iter);
   c_iter->SeekToFirst();
 
@@ -1798,6 +1826,13 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
                            close_file_func, prev_cpu_micros);
 
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
+
+  if (!local_involved_cuids.empty()) {
+      // 加锁，因为 ProcessKeyValueCompaction 可能在多个线程中并发运行
+      std::lock_guard<std::mutex> lock(cuids_mutex_);
+      compaction_involved_cuids_.insert(local_involved_cuids.begin(), 
+                                        local_involved_cuids.end());
+  }
 
   FinalizeSubcompaction(sub_compact, status, open_file_func, close_file_func,
                         blob_resources.blob_file_builder.get(), c_iter.get(),
@@ -2418,6 +2453,10 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 }
 
 void CompactionJob::CleanupCompaction() {
+  if (hotspot_manager_) {
+      compaction_involved_cuids_.clear();
+      input_file_numbers_.clear(); 
+  }
 
   for (SubcompactionState& sub_compact : compact_->sub_compact_states) {
     sub_compact.Cleanup(table_cache_.get());

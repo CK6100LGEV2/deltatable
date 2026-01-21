@@ -773,6 +773,7 @@ set(SOURCES
         db/write_stall_stats.cc
         db/write_thread.cc
         db_stress_tool/db_stress_compression_manager.cc
+        delta/hotspot_manager.cc
         delta/global_delete_count_table.cc
         env/composite_env.cc
         env/env.cc
@@ -1694,3 +1695,6 @@ option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
+
+# add_executable(rocksdb_scan test/rocksdb_scan.cc db/db_test_util.cc)
+# target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

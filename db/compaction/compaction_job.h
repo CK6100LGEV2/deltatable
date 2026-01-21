@@ -31,6 +31,7 @@
 #include "db/version_edit.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
+#include "delta/hotspot_manager.h"
 #include "logging/event_logger.h"
 #include "options/cf_options.h"
 #include "options/db_options.h"
@@ -162,7 +163,9 @@ class CompactionJob {
                 std::string full_history_ts_low = "", std::string trim_ts = "",
                 BlobFileCompletionCallback* blob_callback = nullptr,
                 int* bg_compaction_scheduled = nullptr,
-                int* bg_bottom_compaction_scheduled = nullptr);
+                int* bg_bottom_compaction_scheduled = nullptr,
+                // for delta
+                std::shared_ptr<HotspotManager> hotspot_manager = nullptr);
 
   virtual ~CompactionJob();
 
@@ -390,7 +393,8 @@ class CompactionJob {
       SubcompactionState* sub_compact, ColumnFamilyData* cfd,
       InternalIterator* input_iter, const CompactionFilter* compaction_filter,
       MergeHelper& merge, BlobFileResources& blob_resources,
-      const WriteOptions& write_options);
+      const WriteOptions& write_options,
+      std::unordered_set<uint64_t>* local_involved_cuids);
   std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc> CreateFileHandlers(
       SubcompactionState* sub_compact, SubcompactionKeyBoundaries& boundaries);
   Status ProcessKeyValue(SubcompactionState* sub_compact, ColumnFamilyData* cfd,
@@ -557,6 +561,11 @@ class CompactionJob {
   void UpdateSubcompactionProgressPerLevel(
       SubcompactionState* sub_compact, bool is_proximal_level,
       SubcompactionProgress& subcompaction_progress);
+
+  std::shared_ptr<HotspotManager> hotspot_manager_;
+  std::vector<uint64_t> input_file_numbers_;
+  std::unordered_set<uint64_t> compaction_involved_cuids_;
+  std::mutex cuids_mutex_;
 };
 
 // CompactionServiceInput is used the pass compaction information between two
