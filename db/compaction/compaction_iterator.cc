@@ -481,7 +481,7 @@ void CompactionIterator::CheckHotspotFilters() {
   // 
   if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
     skip_current_cuid_ = true;
-    // hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_); 防止 compaction 失败
+    // hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_); // todo：防止 compaction 失败
     return; 
   }
 

@@ -117,8 +117,15 @@ class BlockBasedTableBuilder : public TableBuilder {
                                    uint64_t oldest_ancestor_time) override;
 
   uint64_t GetWorkerCPUMicros() const override;
+  
+  // [Delta Fix] 获取该文件包含的所有 CUID
+  const std::unordered_set<uint64_t>& GetContainedCUIDs() const {
+    return contained_cuids_;
+  }
 
  private:
+  // [Delta Fix] 追踪当前文件中包含的 CUID
+  std::unordered_set<uint64_t> contained_cuids_;
   bool ok() const;
 
   // Transition state from buffered to unbuffered if the conditions are met. See

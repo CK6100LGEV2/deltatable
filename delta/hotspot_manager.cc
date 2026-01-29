@@ -66,4 +66,20 @@ std::string HotspotManager::GenerateSstFileName(uint64_t cuid) {
   ss << data_dir_ << "/hot_" << cuid << "_" << timestamp << ".sst";
   return ss.str();
 }
+
+// [Delta Fix] 实现转发逻辑
+void HotspotManager::RegisterFileRefs(uint64_t file_number, const std::unordered_set<uint64_t>& cuids) {
+    for (uint64_t cuid : cuids) {
+        delete_table_.TrackPhysicalUnit(cuid, file_number);
+    }
+}
+
+void HotspotManager::ApplyCompactionResult(
+    const std::unordered_set<uint64_t>& involved_cuids,
+    const std::vector<uint64_t>& input_files,
+    uint64_t output_file,
+    const std::unordered_set<uint64_t>& survivor_cuids) {
+    
+    delete_table_.AtomicCompactionUpdate(involved_cuids, input_files, output_file, survivor_cuids);
+}
 }  // namespace ROCKSDB_NAMESPACE

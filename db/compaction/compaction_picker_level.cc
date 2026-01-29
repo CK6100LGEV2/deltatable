@@ -516,155 +516,195 @@ struct L0CandidateScore {
   double score; // 分数越高优先级越高
 };
 
-// 智能 L0->L1 Picker
-// 目标：在控制写放大的前提下，优先回收老数据
+// 辅助结构：记录窗口状态
+struct WindowState {
+  int start_index = -1;
+  int end_index = -1;
+  double score = -1.0;
+  uint64_t l0_bytes = 0;
+  uint64_t l1_bytes = 0;
+  bool is_trivial_move = false;
+};
+
+// 辅助函数：估算文件的垃圾密度 (Report 5.4)
+// 使用 compensated_range_deletion_size 作为 Tombstone 密度的代理
+double GetGarbageDensity(const FileMetaData* f) {
+  if (f->fd.GetFileSize() == 0) return 0.0;
+  // RocksDB 会记录补偿后的删除大小，如果该值远大于物理大小，说明删除很密集
+  return static_cast<double>(f->compensated_range_deletion_size) / 
+         static_cast<double>(f->fd.GetFileSize());
+}
+
 bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
-  // 0. 环境准备与依赖获取
-  const auto* icmp = vstorage_->InternalComparator(); // 修复 icmp_ 未定义问题
+  // 0. 环境准备
+  const auto* icmp = vstorage_->InternalComparator();
   const auto& l0_files = vstorage_->LevelFiles(0);
   const int target_level = 1;
-  
-  // 触发条件检查：如果 L0 文件数不足，不进行 Smart Picking
-  if (l0_files.size() < mutable_cf_options_.level0_file_num_compaction_trigger) {
+  const size_t total_files = l0_files.size();
+
+  // 触发条件检查
+  if (total_files < mutable_cf_options_.level0_file_num_compaction_trigger) {
     return false;
   }
 
   uint64_t current_time = ioptions_.env->NowMicros() / 1000000;
+  
+  // 配置参数 (可提升为 Options)
+  const uint64_t kMaxWindowSize = mutable_cf_options_.max_compaction_bytes; 
+  const double kMinEfficiency = 0.1; // 熔断阈值: 写放大系数 > 10 (1/0.1) 则熔断
+  const int kMaxLookahead = 8;       // 滑动窗口最大向后看几个文件 (控制 CPU 开销)
 
-  // 定义候选评分结构 (局部定义，保证即插即用)
-  struct Candidate {
-    FileMetaData* file;
-    size_t index;
-    uint64_t l1_overlap_bytes;
-    double score; // 分数越高优先级越高
-  };
+  WindowState best_window;
 
-  std::vector<Candidate> candidates;
-  candidates.reserve(l0_files.size());
+  // -----------------------------------------------------------
+  // 1. 滑动窗口算法 (Report 5.1)
+  // -----------------------------------------------------------
+  for (size_t start = 0; start < total_files; ++start) {
+    if (l0_files[start]->being_compacted) continue;
 
-  // 1. 遍历所有 L0 文件进行评分
-  for (size_t i = 0; i < l0_files.size(); ++i) {
-    FileMetaData* f = l0_files[i];
-    if (f->being_compacted) continue;
+    // 窗口状态初始化
+    InternalKey win_smallest = l0_files[start]->smallest;
+    InternalKey win_largest = l0_files[start]->largest;
+    uint64_t win_l0_size = 0;
+    uint64_t oldest_creation_time = l0_files[start]->file_creation_time;
+    double max_garbage_density = GetGarbageDensity(l0_files[start]);
 
-    // A. 计算与 L1 的重叠大小 (Cost)
-    // GetOverlappingInputs 会找到 L1 中与 f 有重叠的所有文件
-    std::vector<FileMetaData*> l1_overlaps;
-    vstorage_->GetOverlappingInputs(target_level, &f->smallest, &f->largest, &l1_overlaps);
-    
-    uint64_t overlap_bytes = 0;
-    for (const auto* l1_f : l1_overlaps) {
-      overlap_bytes += l1_f->fd.GetFileSize();
+    // 向后扩展窗口
+    for (size_t end = start; end < std::min(total_files, start + kMaxLookahead); ++end) {
+      FileMetaData* f = l0_files[end];
+
+      // 窗口断裂检查
+      if (f->being_compacted) break;
+
+      // 更新窗口边界 (Union Range)
+      if (icmp->Compare(f->smallest, win_smallest) < 0) win_smallest = f->smallest;
+      if (icmp->Compare(f->largest, win_largest) > 0) win_largest = f->largest;
+      
+      // 更新统计信息
+      win_l0_size += f->fd.GetFileSize();
+      if (f->file_creation_time < oldest_creation_time) {
+          oldest_creation_time = f->file_creation_time;
+      }
+      max_garbage_density = std::max(max_garbage_density, GetGarbageDensity(f));
+
+      // 窗口大小限制
+      if (win_l0_size > kMaxWindowSize && end > start) break;
+
+      // -----------------------------------------------------------
+      // 2. 计算代价与收益 (Report 2.1 & 2.3)
+      // -----------------------------------------------------------
+      
+      // A. 获取 L1 重叠文件 (Cost)
+      std::vector<FileMetaData*> l1_overlaps;
+      vstorage_->GetOverlappingInputs(target_level, &win_smallest, &win_largest, &l1_overlaps);
+      
+      uint64_t win_l1_size = 0;
+      for (const auto* l1_f : l1_overlaps) {
+        win_l1_size += l1_f->fd.GetFileSize();
+      }
+
+      // B. Trivial Move 优先判定 (Report 2.2)
+      if (win_l1_size == 0) {
+        best_window.start_index = start;
+        best_window.end_index = end;
+        best_window.is_trivial_move = true;
+        best_window.score = 1000000.0; // Max Score
+        goto finalize_selection; // 找到最优解，直接跳出双层循环
+      }
+
+      // C. 效率因子 (Efficiency)
+      double total_io = static_cast<double>(win_l0_size + win_l1_size);
+      double efficiency = static_cast<double>(win_l0_size) / total_io;
+
+      // D. 时间权重 (Age Factor) - Report 2.3
+      uint64_t age_seconds = (current_time > oldest_creation_time) 
+                             ? (current_time - oldest_creation_time) : 0;
+      double age_hours = static_cast<double>(age_seconds) / 3600.0;
+      double age_factor = 1.0 + std::min(3.0, age_hours * 0.2); 
+
+      // E. 垃圾密度加权 (Report 5.4)
+      // 如果包含大量墓碑，大幅提升优先级
+      double garbage_factor = 1.0 + std::min(2.0, max_garbage_density * 2.0);
+
+      // F. 最终得分
+      double final_score = efficiency * age_factor * garbage_factor;
+
+      // 更新全局最佳
+      if (final_score > best_window.score) {
+        best_window.score = final_score;
+        best_window.start_index = static_cast<int>(start);
+        best_window.end_index = static_cast<int>(end);
+        best_window.l0_bytes = win_l0_size;
+        best_window.l1_bytes = win_l1_size;
+      }
     }
+  }
 
-    // B. Trivial Move 检测 (最高优先级：零写放大)
-    // 如果 L1 没有重叠文件，直接移动，这是最优解
-    if (overlap_bytes == 0) {
+finalize_selection:
+
+  // -----------------------------------------------------------
+  // 3. 决策与熔断 (Report 5.2)
+  // -----------------------------------------------------------
+  
+  if (best_window.start_index == -1) {
+    return false;
+  }
+
+  // 计算最佳窗口的效率
+  double best_efficiency = 0.0;
+  if (best_window.l0_bytes + best_window.l1_bytes > 0) {
+      best_efficiency = static_cast<double>(best_window.l0_bytes) / 
+                        static_cast<double>(best_window.l0_bytes + best_window.l1_bytes);
+  }
+
+  // 熔断检查：如果不是 Trivial Move 且效率低于阈值 (写放大过高)
+  if (!best_window.is_trivial_move && best_efficiency < kMinEfficiency) {
+      
+      // >>> 触发 L0-L0 (Intra-L0) 降级策略 <<<
+      ROCKS_LOG_WARN(ioptions_.logger, 
+          "[Delta-Smart] Fuse Triggered! Efficiency %.4f < %.4f. Checking for L0-L0 opportunity.", 
+          best_efficiency, kMinEfficiency);
+
+      // 寻找 L0 内部最老的一批文件进行合并，不涉及 L1
+      // 目标：通过 GDCT 清理物理空间，减少文件数
+      size_t intra_end = total_files - 1;
+      size_t intra_start = (total_files > 5) ? total_files - 5 : 0; // 选最后5个
+      
       start_level_inputs_.level = 0;
       start_level_inputs_.files.clear();
-      start_level_inputs_.files.push_back(f);
-      output_level_ = target_level;
-      
+      for (size_t i = intra_start; i <= intra_end; ++i) {
+          if (!l0_files[i]->being_compacted) {
+              start_level_inputs_.files.push_back(l0_files[i]);
+          }
+      }
+
+      if (start_level_inputs_.files.size() < 2) {
+          return false; // 无法构建有效的 L0-L0
+      }
+
+      output_level_ = 0; // 强制 L0 -> L0
       compaction_reason_ = CompactionReason::kLevelL0FilesNum;
-      ROCKS_LOG_BUFFER(log_buffer_, "[Delta-Smart] Picked Trivial Move: File %" PRIu64, f->fd.GetNumber());
+      ROCKS_LOG_BUFFER(log_buffer_, "[Delta-Smart] Fallback to Intra-L0 Compaction. Files: %zu", 
+                       start_level_inputs_.files.size());
       return true;
-    }
-
-    // C. 计算写放大效率 (Efficiency Factor)
-    // 效率 = 自身大小 / (自身大小 + 重叠大小)
-    // 范围 (0, 1]。越接近 1，说明重叠越少，合并越划算。
-    double self_size = static_cast<double>(f->fd.GetFileSize());
-    double total_io = self_size + static_cast<double>(overlap_bytes);
-    double efficiency = self_size / total_io;
-
-    // D. 计算年龄权重 (Age Factor - GC Benefit)
-    // 越老的文件，包含“逻辑删除”数据的概率越高。我们希望给老文件加权。
-    // 假设：每存活 1 小时，权重增加 0.1，上限 2.0 倍。
-    uint64_t age_seconds = (current_time > f->file_creation_time) 
-                           ? (current_time - f->file_creation_time) : 0;
-    double age_hours = static_cast<double>(age_seconds) / 3600.0;
-    // 权重曲线：1.0 (新文件) -> 2.0 (10小时以上的老文件)
-    double age_factor = 1.0 + std::min(1.0, age_hours * 0.1);
-
-    // E. 最终得分
-    double final_score = efficiency * age_factor;
-
-    candidates.push_back({f, i, overlap_bytes, final_score});
   }
 
-  // 如果没有可用的候选文件
-  if (candidates.empty()) return false;
-
-  // 2. 选择得分最高的“最佳文件”
-  // 使用 std::max_element 避免全量排序，效率更高
-  auto best_it = std::max_element(candidates.begin(), candidates.end(), 
-      [](const Candidate& a, const Candidate& b) {
-          return a.score < b.score;
-      });
-  const Candidate& best = *best_it;
-
-  // 3. 碎片聚合 (Expansion / Batching)
-  // 为了减少 L0 文件数，尝试“顺便”带上其他 L0 文件。
-  // 原则：只要其他 L0 文件完全落在 "Best文件的 L1 重叠范围" 内，带上它们就不会增加 L1 层的读开销。
-  
+  // -----------------------------------------------------------
+  // 4. 构造 L0->L1 Compaction
+  // -----------------------------------------------------------
   start_level_inputs_.level = 0;
   start_level_inputs_.files.clear();
+  for (int i = best_window.start_index; i <= best_window.end_index; ++i) {
+    start_level_inputs_.files.push_back(l0_files[i]);
+  }
   output_level_ = target_level;
-
-  // 3.1 确定 L1 侧的边界 [boundary_min, boundary_max]
-  // 我们需要手动计算 overlaps 的边界，替代 GetRange 辅助函数
-  InternalKey boundary_min, boundary_max;
-  {
-    std::vector<FileMetaData*> best_l1_overlaps;
-    vstorage_->GetOverlappingInputs(target_level, &best.file->smallest, &best.file->largest, &best_l1_overlaps);
-    
-    if (!best_l1_overlaps.empty()) {
-      boundary_min = best_l1_overlaps[0]->smallest;
-      boundary_max = best_l1_overlaps[0]->largest;
-      for (const auto* l1_f : best_l1_overlaps) {
-        if (icmp->Compare(l1_f->smallest, boundary_min) < 0) boundary_min = l1_f->smallest;
-        if (icmp->Compare(l1_f->largest, boundary_max) > 0) boundary_max = l1_f->largest;
-      }
-    } else {
-      // 理论上不可能进入这里，因为前面 Trivial Move 已经处理了 overlap=0 的情况
-      // 但为了健壮性，如果没有 overlap，边界就是文件自身
-      boundary_min = best.file->smallest;
-      boundary_max = best.file->largest;
-    }
-  }
-
-  // 3.2 贪心扩展：遍历所有 L0 文件，寻找“顺路车”
-  // 注意：为了保持 Input Files 的某种顺序性（虽然 L0 是重叠的），我们通常按列表顺序添加
-  // 也可以只扩展相邻索引，但全量扫描 L0 寻找“包围在内”的文件收益更高
   
-  // 先加入 Best 文件
-  std::vector<FileMetaData*> picked_files;
-  picked_files.push_back(best.file);
-
-  for (size_t i = 0; i < l0_files.size(); ++i) {
-    FileMetaData* f = l0_files[i];
-    if (f == best.file || f->being_compacted) continue;
-
-    // 检查是否完全包含在 L1 边界内
-    // Condition: f->smallest >= boundary_min AND f->largest <= boundary_max
-    if (icmp->Compare(f->smallest, boundary_min) >= 0 && 
-        icmp->Compare(f->largest, boundary_max) <= 0) {
-        picked_files.push_back(f);
-    }
-  }
-
-  // 4. 将结果填入 start_level_inputs_
-  // RocksDB 要求 input files 按某种顺序排列（通常不需要严格排序，但保持稳定较好）
-  // 这里我们简单地将收集到的文件加入
-  for (auto* f : picked_files) {
-      start_level_inputs_.files.push_back(f);
-  }
-
   compaction_reason_ = CompactionReason::kLevelL0FilesNum;
-  
+
   ROCKS_LOG_BUFFER(log_buffer_, 
-      "[Delta-Smart] Picked L0->L1. BestFile: %" PRIu64 " (Score %.2f), Total Inputs: %zu", 
-      best.file->fd.GetNumber(), best.score, start_level_inputs_.size());
+      "[Delta-Smart] Picked L0->L1. Files: %d-%d, Score: %.2f, Type: %s", 
+      best_window.start_index, best_window.end_index, best_window.score,
+      best_window.is_trivial_move ? "Trivial" : "Merge");
 
   return true;
 }

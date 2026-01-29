@@ -1462,9 +1462,31 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
 void BlockBasedTableBuilder::Add(const Slice& ikey, const Slice& value) {
   Rep* r = rep_.get();
   assert(rep_->state != Rep::State::kClosed);
+  
+  // 1. 先进行标准错误检查
   if (UNLIKELY(!ok())) {
     return;
   }
+
+  // [Delta Fix Start] 
+  // 捕获 CUID 用于引用计数闭环。
+  // 注意：ikey 是 InternalKey，其数据布局为 [User Key] [Footer(8 bytes)]。
+  // 只要 CUID 位于 User Key 的前 24 字节内，直接操作 ikey.data() 是安全的。
+  if (ikey.size() >= 24) {
+      const unsigned char* p = reinterpret_cast<const unsigned char*>(ikey.data()) + 16;
+      uint64_t cuid = (static_cast<uint64_t>(p[0]) << 56) |
+                      (static_cast<uint64_t>(p[1]) << 48) |
+                      (static_cast<uint64_t>(p[2]) << 40) |
+                      (static_cast<uint64_t>(p[3]) << 32) |
+                      (static_cast<uint64_t>(p[4]) << 24) |
+                      (static_cast<uint64_t>(p[5]) << 16) |
+                      (static_cast<uint64_t>(p[6]) << 8)  |
+                      (static_cast<uint64_t>(p[7]));
+      // contained_cuids_ 是在 .h 文件中新增的私有成员 std::unordered_set<uint64_t>
+      contained_cuids_.insert(cuid);
+  }
+  // [Delta Fix End]
+
   ValueType value_type;
   SequenceNumber seq;
   UnPackSequenceAndType(ExtractInternalKeyFooter(ikey), &seq, &value_type);

@@ -379,6 +379,17 @@ Status BuildTable(
       if (table_properties) {
         *table_properties = tp;
       }
+
+      // [Delta Fix] 内部闭环：在 Builder 销毁前注册 CUID
+      if (hotspot_manager) {
+          // 这里必须使用 dynamic_cast，因为 builder 是 TableBuilder 基类
+          auto* bb_builder = dynamic_cast<BlockBasedTableBuilder*>(builder);
+          if (bb_builder) {
+              const auto& cuids = bb_builder->GetContainedCUIDs();
+              // 注册文件引用计数
+              hotspot_manager->RegisterFileRefs(meta->fd.GetNumber(), cuids);
+          }
+      }
     }
     delete builder;
 

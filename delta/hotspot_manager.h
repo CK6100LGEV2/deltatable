@@ -67,6 +67,16 @@ class HotspotManager {
 
   std::string GenerateSstFileName(uint64_t cuid);
 
+    // Flush 注册接口
+  void RegisterFileRefs(uint64_t file_number, const std::unordered_set<uint64_t>& cuids);
+  
+  // Compaction 闭环接口
+  void ApplyCompactionResult(
+      const std::unordered_set<uint64_t>& involved_cuids,
+      const std::vector<uint64_t>& input_files,
+      uint64_t output_file,
+      const std::unordered_set<uint64_t>& survivor_cuids);
+
  private:
   Options db_options_;
   std::string data_dir_;

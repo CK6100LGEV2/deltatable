@@ -46,6 +46,13 @@ class GlobalDeleteCountTable {
 
   int GetRefCount(uint64_t cuid) const;
 
+  // Compaction 原子更新：移除 Input 引用，添加 Output 引用，清理死数据
+  void AtomicCompactionUpdate(
+      const std::unordered_set<uint64_t>& involved_cuids,
+      const std::vector<uint64_t>& input_files,
+      uint64_t output_file,
+      const std::unordered_set<uint64_t>& survivor_cuids);
+
  private:
   mutable std::shared_mutex mutex_;
   std::unordered_map<uint64_t, GDCTEntry> table_;

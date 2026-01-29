@@ -1483,7 +1483,8 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       hotspot_manager,
       input_file_numbers);
 
-  if (c_iter) {
+  // for delta    
+  if (c_iter && hotspot_manager_) {
       c_iter->SetInvolvedCuids(local_involved_cuids);
   }
 
@@ -2271,12 +2272,49 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     compaction->ReleaseCompactionFiles(s);
     *compaction_released = true;
   };
-
-  return versions_->LogAndApply(compaction->column_family_data(), read_options,
+  
+  Status status = versions_->LogAndApply(compaction->column_family_data(), read_options,
                                 write_options, edit, db_mutex_, db_directory_,
                                 /*new_descriptor_log=*/false,
                                 /*column_family_options=*/nullptr,
                                 manifest_wcb);
+
+  // [Delta Fix] Compaction 闭环：原子更新 GDCT 引用
+  // 必须在 LogAndApply 成功后执行，确保物理变更已提交
+  if (status.ok() && hotspot_manager_) {
+      // 1. 准备 Input Files (被删除的文件)
+      // 注意：input_file_numbers_ 应该在 Job 初始化时已填充
+      
+      // 2. 准备 Output File ID (新生成的文件)
+      uint64_t output_id = 0;
+      std::unordered_set<uint64_t> survivor_cuids;
+      
+      const auto& new_files = compact_->edit()->GetNewFiles();
+      if (!new_files.empty()) {
+          // 假设 L0-L1 Compaction 生成 1 个文件 (如果是多个需遍历处理)
+          output_id = new_files[0].second.fd.GetNumber();
+          
+          // 从 Builder 获取幸存 CUID
+          auto* bb_builder = dynamic_cast<BlockBasedTableBuilder*>(table_builder_.get());
+          if (bb_builder) {
+              survivor_cuids = bb_builder->GetContainedCUIDs();
+          }
+      }
+
+      // 3. 执行原子更新
+      // compaction_involved_cuids_ 是在 Iterator 运行过程中收集的
+      hotspot_manager_->ApplyCompactionResult(
+          compaction_involved_cuids_, 
+          input_file_numbers_,        
+          output_id,                  
+          survivor_cuids              
+      );
+      
+      // 清理临时状态
+      compaction_involved_cuids_.clear();
+  }
+
+  return status;
 }
 
 void CompactionJob::RecordCompactionIOStats() {

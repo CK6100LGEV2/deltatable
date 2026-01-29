@@ -76,4 +76,38 @@ bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
   return table_.find(cuid) != table_.end();
 }
 
+void GlobalDeleteCountTable::AtomicCompactionUpdate(
+    const std::unordered_set<uint64_t>& involved_cuids,
+    const std::vector<uint64_t>& input_files,
+    uint64_t output_file,
+    const std::unordered_set<uint64_t>& survivor_cuids) {
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    // 遍历所有卷入 Compaction 的 CUID (这些 CUID 的 Input 引用必须移除)
+    for (uint64_t cuid : involved_cuids) {
+        auto it = table_.find(cuid);
+        if (it == table_.end()) continue;
+
+        auto& entry = it->second;
+
+        // 1. 移除旧文件(Input)的引用 (Ref Count --)
+        for (uint64_t old_fid : input_files) {
+            entry.tracked_phys_ids.erase(old_fid);
+        }
+
+        // 2. 添加新文件(Output)的引用 (Ref Count ++)
+        // 只有当该 CUID 确实被写入了 Output 文件时才添加 (幸存者)
+        if (output_file > 0 && survivor_cuids.count(cuid)) {
+            entry.tracked_phys_ids.insert(output_file);
+        }
+
+        // 3. 垃圾回收检查 (The GC)
+        // 如果引用归零，且已被逻辑删除，说明物理数据已彻底清除，回收内存条目
+        if (entry.tracked_phys_ids.empty() && entry.is_deleted) {
+            table_.erase(it);
+        }
+    }
+}
+
 } // namespace ROCKSDB_NAMESPACE
