@@ -111,10 +111,10 @@ CompactionIterator::CompactionIterator(
       cmp_with_history_ts_low_(0),
       level_(compaction_ == nullptr ? 0 : compaction_->level()),
       preserve_seqno_after_(preserve_seqno_min.value_or(earliest_snapshot)),
-      hotspot_manager_(hotspot_manager), // for delta new Init
       current_cuid_(0),
       skip_current_cuid_(false),
-      input_file_numbers_(std::move(input_file_numbers)) {
+      input_file_numbers_(std::move(input_file_numbers)),
+      hotspot_manager_(hotspot_manager) {
   assert(snapshots_ != nullptr);
   assert(preserve_seqno_after_ <= earliest_snapshot_);
 

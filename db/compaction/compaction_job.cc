@@ -56,6 +56,7 @@
 #include "table/meta_blocks.h"
 #include "table/table_builder.h"
 #include "table/unique_id_impl.h"
+#include "table/block_based/block_based_table_builder.h"
 #include "test_util/sync_point.h"
 #include "util/stop_watch.h"
 
@@ -1495,9 +1496,7 @@ std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc>
 CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
                                   SubcompactionKeyBoundaries& boundaries) {
   // auto delta_ctx = std::make_shared<DeltaCompactionContext>();
-  const CompactionFileOpenFunc open_file_func =
-      [this, sub_compact](CompactionOutputs& outputs) {
-        return this->OpenCompactionOutputFile(sub_compact, outputs);
+    const CompactionFileOpenFunc open_file_func =
       [this, sub_compact](CompactionOutputs& outputs) {
         return this->OpenCompactionOutputFile(sub_compact, outputs);
       };
@@ -1506,10 +1505,8 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
       sub_compact->start.has_value() ? &boundaries.start_user_key : nullptr;
   const Slice* end_user_key =
       sub_compact->end.has_value() ? &boundaries.end_user_key : nullptr;
-  
-  const CompactionFileCloseFunc close_file_func =
-      [this, sub_compact, start_user_key, end_user_key](
-      [this, sub_compact, start_user_key, end_user_key](
+
+  const CompactionFileCloseFunc close_file_func =[this, sub_compact, start_user_key, end_user_key](
           const Status& status,
           const ParsedInternalKey& prev_iter_output_internal_key,
           const Slice& next_table_min_key, const CompactionIterator* c_iter,
@@ -1526,7 +1523,6 @@ CompactionJob::CreateFileHandlers(SubcompactionState* sub_compact,
 Status CompactionJob::ProcessKeyValue(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     CompactionIterator* c_iter, const CompactionFileOpenFunc& open_file_func,
-    const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros) {
     const CompactionFileCloseFunc& close_file_func, uint64_t& prev_cpu_micros) {
   Status status;
   const uint64_t kRecordStatsEvery = 1000;
@@ -1973,6 +1969,17 @@ Status CompactionJob::FinishCompactionOutputFile(
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::FinishCompactionOutputFile()::AfterFinish", &s);
 
+  if (s.ok() && hotspot_manager_) {
+      TableBuilder* builder = outputs.GetBuilder();
+      // 使用 dynamic_cast 确保是 BlockBasedTableBuilder
+      auto* bb_builder = static_cast<BlockBasedTableBuilder*>(builder);
+      if (bb_builder) {
+          // 加锁，保存当前 Output 文件的 CUID 集合
+          std::lock_guard<std::mutex> lock(output_cuids_mutex_);
+          output_cuids_[output_number] = bb_builder->GetContainedCUIDs();
+      }
+  }
+
   if (s.ok()) {
     // With accurate smallest and largest key, we can get a slightly more
     // accurate oldest ancester time.
@@ -2280,38 +2287,43 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
                                 manifest_wcb);
 
   // [Delta Fix] Compaction 闭环：原子更新 GDCT 引用
-  // 必须在 LogAndApply 成功后执行，确保物理变更已提交
   if (status.ok() && hotspot_manager_) {
-      // 1. 准备 Input Files (被删除的文件)
-      // 注意：input_file_numbers_ 应该在 Job 初始化时已填充
+      // 修正：从 compact_->compaction->edit() 获取
+      const auto& new_files = compact_->compaction->edit()->GetNewFiles();
       
-      // 2. 准备 Output File ID (新生成的文件)
-      uint64_t output_id = 0;
-      std::unordered_set<uint64_t> survivor_cuids;
-      
-      const auto& new_files = compact_->edit()->GetNewFiles();
       if (!new_files.empty()) {
-          // 假设 L0-L1 Compaction 生成 1 个文件 (如果是多个需遍历处理)
-          output_id = new_files[0].second.fd.GetNumber();
-          
-          // 从 Builder 获取幸存 CUID
-          auto* bb_builder = dynamic_cast<BlockBasedTableBuilder*>(table_builder_.get());
-          if (bb_builder) {
-              survivor_cuids = bb_builder->GetContainedCUIDs();
+          for (const auto& file_meta : new_files) {
+              // 这里的变量只在循环内部定义，避免 Shadow 报错
+              uint64_t output_id = file_meta.second.fd.GetNumber();
+              std::unordered_set<uint64_t> survivor_cuids;
+
+              // 从之前保存的 map 中查找幸存的 CUID
+              auto it = output_cuids_.find(output_id);
+              if (it != output_cuids_.end()) {
+                  survivor_cuids = it->second;
+              }
+
+              // 执行原子更新
+              hotspot_manager_->ApplyCompactionResult(
+                  compaction_involved_cuids_, 
+                  input_file_numbers_,        
+                  output_id,                  
+                  survivor_cuids              
+              );
           }
+      } else {
+          // 如果没有任何新文件生成（例如全被 GC 丢弃了），也要清理旧引用
+          hotspot_manager_->ApplyCompactionResult(
+              compaction_involved_cuids_, 
+              input_file_numbers_,        
+              0,                  
+              {}              
+          );
       }
 
-      // 3. 执行原子更新
-      // compaction_involved_cuids_ 是在 Iterator 运行过程中收集的
-      hotspot_manager_->ApplyCompactionResult(
-          compaction_involved_cuids_, 
-          input_file_numbers_,        
-          output_id,                  
-          survivor_cuids              
-      );
-      
       // 清理临时状态
       compaction_involved_cuids_.clear();
+      output_cuids_.clear();
   }
 
   return status;

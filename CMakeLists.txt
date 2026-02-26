@@ -1696,5 +1696,6 @@ if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
 
-# add_executable(rocksdb_scan test/rocksdb_scan.cc db/db_test_util.cc)
-# target_link_libraries(rocksdb_scan rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+# for delta
+add_executable(rocksdb_delta_test test/rocksdb_delta_test.cc db/db_test_util.cc)
+target_link_libraries(rocksdb_delta_test rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

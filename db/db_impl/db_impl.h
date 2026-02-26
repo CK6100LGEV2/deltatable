@@ -464,6 +464,10 @@ class DBImpl : public DB {
 
   Status SetDBOptions(
       const std::unordered_map<std::string, std::string>& options_map) override;
+  Status SetOptions(
+      const std::unordered_map<ColumnFamilyHandle*,
+                               std::unordered_map<std::string, std::string>>&
+          column_families_opts_map) override;
 
   using DB::NumberLevels;
   int NumberLevels(ColumnFamilyHandle* column_family) override;

@@ -74,6 +74,6 @@ Status BuildTable(
     Version* version = nullptr, uint64_t* memtable_payload_bytes = nullptr,
     uint64_t* memtable_garbage_bytes = nullptr,
     InternalStats::CompactionStats* flush_stats = nullptr,
-    HotspotManager* hotspot_manager = nullptr);
+    std::unordered_set<uint64_t>* output_contained_cuids = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE

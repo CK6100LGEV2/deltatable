@@ -75,8 +75,7 @@ Status BuildTable(
     Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
     BlobFileCompletionCallback* blob_callback, Version* version,
     uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
-    InternalStats::CompactionStats* flush_stats,
-    HotspotManager* hotspot_manager) {
+    InternalStats::CompactionStats* flush_stats, std::unordered_set<uint64_t>* output_contained_cuids) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -380,7 +379,7 @@ Status BuildTable(
         *table_properties = tp;
       }
 
-      // [Delta Fix] 内部闭环：在 Builder 销毁前注册 CUID
+      /*// [Delta Fix] 内部闭环：在 Builder 销毁前注册 CUID
       if (hotspot_manager) {
           // 这里必须使用 dynamic_cast，因为 builder 是 TableBuilder 基类
           auto* bb_builder = dynamic_cast<BlockBasedTableBuilder*>(builder);
@@ -388,6 +387,12 @@ Status BuildTable(
               const auto& cuids = bb_builder->GetContainedCUIDs();
               // 注册文件引用计数
               hotspot_manager->RegisterFileRefs(meta->fd.GetNumber(), cuids);
+          }
+      }*/
+      if (output_contained_cuids) {
+          auto* bb_builder = static_cast<BlockBasedTableBuilder*>(builder);
+          if (bb_builder) {
+              *output_contained_cuids = bb_builder->GetContainedCUIDs();
           }
       }
     }

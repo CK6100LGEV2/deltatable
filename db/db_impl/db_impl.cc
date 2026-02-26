@@ -1346,6 +1346,19 @@ Status DBImpl::SetOptions(
   return s;
 }
 
+Status DBImpl::SetOptions(
+    ColumnFamilyHandle* column_family,
+    const std::unordered_map<std::string, std::string>& options_map) {
+  
+  // 构造一个包含单个 CF 的 map
+  std::unordered_map<ColumnFamilyHandle*, std::unordered_map<std::string, std::string>>
+      column_families_opts_map;
+  column_families_opts_map.emplace(column_family, options_map);
+  
+  // 调用那个复杂的“多列族版本”来实现功能
+  return SetOptions(column_families_opts_map);
+}
+
 Status DBImpl::SetDBOptions(
     const std::unordered_map<std::string, std::string>& options_map) {
   if (options_map.empty()) {

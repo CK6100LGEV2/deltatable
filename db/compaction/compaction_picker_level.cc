@@ -15,7 +15,7 @@
 
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
-#include "logging.h"
+#include "logging/logging.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -72,7 +72,7 @@ class LevelCompactionBuilder {
         mutable_db_options_(mutable_db_options) {}
 
 
-  bool LevelCompactionBuilder::PickSmartL0ToL1Compaction();
+  bool PickSmartL0ToL1Compaction();
   // Pick and return a compaction.
   Compaction* PickCompaction();
 
@@ -543,7 +543,7 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
   const size_t total_files = l0_files.size();
 
   // 触发条件检查
-  if (total_files < mutable_cf_options_.level0_file_num_compaction_trigger) {
+  if (total_files < static_cast<size_t>(mutable_cf_options_.level0_file_num_compaction_trigger)) {
     return false;
   }
 

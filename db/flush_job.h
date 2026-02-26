@@ -232,6 +232,8 @@ class FlushJob {
   // `earliest_snapshot_` will be output to the proximal level had it gone
   // through a compaction to the last level.
   SequenceNumber preclude_last_level_min_seqno_ = kMaxSequenceNumber;
+  // [Delta Fix]
+  std::unordered_set<uint64_t> committed_cuids_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

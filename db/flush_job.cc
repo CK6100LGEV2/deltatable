@@ -330,6 +330,15 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
               !(mempurge_s.ok()) /* write_edit : true if no mempurge happened (or if aborted),
                               but 'false' if mempurge successful: no new min log number
                               or new level 0 file path to write to manifest. */);
+      
+      // [Delta Fix]
+      if (s.ok() && db_options_.hotspot_manager) {
+          uint64_t new_file_number = meta_.fd.GetNumber();
+          
+          if (!committed_cuids_.empty()) {
+              db_options_.hotspot_manager->RegisterFileRefs(new_file_number, committed_cuids_);
+          }
+      }
     }
   }
 
@@ -845,6 +854,8 @@ bool FlushJob::MemPurgeDecider(double threshold) {
 }
 
 Status FlushJob::WriteLevel0Table() {
+  // [Delta Fix]
+  std::unordered_set<uint64_t> contained_cuids; // 本地变量
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
   db_mutex_->AssertHeld();
@@ -1006,11 +1017,14 @@ Status FlushJob::WriteLevel0Table() {
           seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
           &table_properties_, write_hint, full_history_ts_low, blob_callback_,
           base_, &memtable_payload_bytes, &memtable_garbage_bytes,
-          &flush_stats, db_options_.hotspot_manager.get());
+          &flush_stats, &contained_cuids);
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();
+      if (s.ok()) {
+        committed_cuids_ = std::move(contained_cuids); // 需在 header 添加成员
+      }
       if (s.ok() && total_num_input_entries != flush_stats.num_input_records) {
         std::string msg = "Expected " +
                           std::to_string(total_num_input_entries) +

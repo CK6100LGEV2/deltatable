@@ -16,6 +16,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <map>
 
 #include "db/blob/blob_file_completion_callback.h"
 #include "db/column_family.h"
@@ -566,6 +567,13 @@ class CompactionJob {
   std::vector<uint64_t> input_file_numbers_;
   std::unordered_set<uint64_t> compaction_involved_cuids_;
   std::mutex cuids_mutex_;
+  
+  // [Delta] 记录 Output 文件号对应的 CUID 集合
+  // Key: FileNumber, Value: Set of CUIDs
+  std::map<uint64_t, std::unordered_set<uint64_t>> output_cuids_;
+  
+  // [Delta] 保护 output_cuids_ 的互斥锁
+  std::mutex output_cuids_mutex_;
 };
 
 // CompactionServiceInput is used the pass compaction information between two
