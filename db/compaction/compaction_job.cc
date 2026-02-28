@@ -16,6 +16,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 #include "db/blob/blob_counting_iterator.h"
 #include "db/blob/blob_file_addition.h"
@@ -2290,6 +2291,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
   if (status.ok() && hotspot_manager_) {
       // 修正：从 compact_->compaction->edit() 获取
       const auto& new_files = compact_->compaction->edit()->GetNewFiles();
+
+      if (!new_files.empty() && output_cuids_.empty()) {
+          std::cout << ">> WARNING: Trivial Move detected. Skipping GDCT update to preserve references." << std::endl;
+          compaction_involved_cuids_.clear();
+          return status; 
+      }
       
       if (!new_files.empty()) {
           for (const auto& file_meta : new_files) {

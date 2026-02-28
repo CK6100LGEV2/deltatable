@@ -70,6 +70,13 @@ int NumL1(DB* db) {
     return std::stoi(val);
 }
 
+// 获取 L2 文件数量
+int NumL2(DB* db) {
+    std::string val;
+    db->GetProperty("rocksdb.num-files-at-level2", &val);
+    return std::stoi(val);
+}
+
 int main() {
     // 0. 清理环境
     Options options;
@@ -148,7 +155,11 @@ int main() {
     // 触发 Compaction
     // 注意：CompactRange 内部可能会根据重叠情况决定是否 Trivial Move
     std::cout << "Triggering Compaction..." << std::endl;
-    s = db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    CompactRangeOptions cro;
+    cro.change_level = true; 
+    cro.target_level = 1;    // <--- 强制只去 L1，不去 L2
+    s = db->CompactRange(cro, nullptr, nullptr);
+    std::cout << "DEBUG: L0=" << NumL0(db) << " L1=" << NumL1(db) << " L2=" << NumL2(db) << std::endl;
     Check(s.ok(), "Compaction finished");
 
     // 验证：
@@ -175,6 +186,24 @@ int main() {
     // 因为没有写入新 L1 文件，它没有新引用。
     // Ref 归零 + IsDeleted -> GDCT 条目应该被 erase。
 
+    // 【关键修复】：写入完全相同的 Key，制造 100% 的物理重叠！
+    // 此时 L1 包含[CUID_A_1, CUID_B_1]
+    // 我们向 L0 写入 CUID_B_1，迫使 L0 与 L1 发生真正的 Merge！
+    WriteBatch overlap_batch;
+    overlap_batch.Put(Key(CUID_B, 1), "force_real_merge");
+    s = db->Write(WriteOptions(), &overlap_batch);
+    db->Flush(FlushOptions());
+
+    std::cout << "Triggering REAL Compaction (Merge) for GC..." << std::endl;
+    
+    // 为了干净，我们依然限制它在 L1 结算，防止它 Merge 完又 Trivial Move 到 L2 导致日志干扰
+    CompactRangeOptions cro_gc;
+    cro_gc.change_level = true;
+    cro_gc.target_level = 1;
+    s = db->CompactRange(cro_gc, nullptr, nullptr); 
+    Check(s.ok(), "Real Compaction finished");
+
+
     // 验证：CUID_A 彻底消失 (Ref 返回 -1 表示 key 不存在)
     int final_ref_a = GetRef(db, CUID_A);
     
@@ -186,6 +215,107 @@ int main() {
                   << " Deleted: " << GetDeleted(db, CUID_A) << std::endl;
         exit(1);
     }
+
+    // 场景 5: 全量 GC 黑洞测试 (Zero Output Files)
+    // ==========================================================
+    std::cout << "\n--- Scenario 5: Full GC (Zero Outputs) ---" << std::endl;
+    
+    const uint64_t CUID_C = 300;
+    
+    // 【步骤 1：在 L1 牢牢钉入一个底座文件】
+    WriteBatch base_batch;
+    base_batch.Put(Key(CUID_C, 1), "L1_BASE_DATA");
+    db->Write(WriteOptions(), &base_batch);
+    db->Flush(FlushOptions());
+    
+    CompactRangeOptions cro_base;
+    cro_base.change_level = true;
+    cro_base.target_level = 1;
+    db->CompactRange(cro_base, nullptr, nullptr); // 压入 L1
+    
+    std::cout << "[Trace] After Base Setup -> L0: " << NumL0(db) << " L1: " << NumL1(db) << std::endl;
+    Check(GetRef(db, CUID_C) == 1, "Base Ref should be 1");
+
+    // 【步骤 2：对 CUID_C 下达必杀令（逻辑删除）】
+    db->Delete(WriteOptions(), Key(CUID_C, 1));
+    Check(GetDeleted(db, CUID_C), "CUID_C marked deleted in GDCT");
+
+    // 【步骤 3：在 L0 写入重叠的幽灵数据】
+    // 此时 L1 有 CUID_C_1，L0 又来一个 CUID_C_1。绝对重叠！神仙也无法 Trivial Move！
+    WriteBatch ghost_batch;
+    ghost_batch.Put(Key(CUID_C, 1), "L0_GHOST_DATA");
+    db->Write(WriteOptions(), &ghost_batch);
+    db->Flush(FlushOptions());
+    
+    std::cout << "[Trace] After Ghost Setup -> L0: " << NumL0(db) << " L1: " << NumL1(db) << std::endl;
+    Check(GetRef(db, CUID_C) == 2, "Ghost Ref should be 2");
+
+    // 【步骤 4：发起最后的总攻 (强制跨层级合并)】
+    std::cout << "Triggering inescapable Merge Compaction..." << std::endl;
+    CompactRangeOptions cro_full_gc;
+    // 不设 target_level，让它在所有层级发生碰撞
+    s = db->CompactRange(cro_full_gc, nullptr, nullptr); 
+    Check(s.ok(), "Full GC Compaction finished");
+    
+    std::cout << "[Trace] After Full GC -> L0: " << NumL0(db) << " L1: " << NumL1(db) << std::endl;
+
+    // 【步骤 5：验证 GDCT 彻底清空】
+    int ref_c = GetRef(db, CUID_C);
+    if (ref_c == -1) {
+        Check(true, "CUID_C fully GC'ed even with ZERO output files!");
+    } else {
+        std::cerr << "[FAIL] CUID_C still exists. Actual Ref: " << ref_c << std::endl;
+        exit(1);
+    }
+
+
+    // 场景 6: 多文件分裂测试 (Multi-File Output)
+    // ==========================================================
+    std::cout << "\n--- Scenario 6: Multi-File Output (SST Split) ---" << std::endl;
+    
+    const uint64_t CUID_D = 400;
+    
+    // 【修复 1：在 L1 部署一个重叠底座，封死 Trivial Move】
+    WriteBatch base_d;
+    base_d.Put(Key(CUID_D, -1), "L1_base_for_D"); // 用一个负数 Key 确保范围覆盖
+    db->Write(WriteOptions(), &base_d);
+    db->Flush(FlushOptions());
+    CompactRangeOptions cro_base_d;
+    cro_base_d.change_level = true;
+    cro_base_d.target_level = 1;
+    db->CompactRange(cro_base_d, nullptr, nullptr);
+    Check(NumL1(db) > 0, "Base for CUID_D created in L1");
+
+    // 1. 疯狂写入同一个 CUID，使其超过 target_file_size_base (默认 64MB，我们需要改小)
+    // 我们在 Options 中设置 target_file_size_base=2MB
+    // Key(1KB) + Value(1KB) = 2KB。写入 2000 条就是 4MB，应该分裂成至少 2 个文件
+    std::cout << "Writing large amount of data for CUID_D to force split..." << std::endl;
+    for (int i = 0; i < 2000; ++i) {
+        WriteBatch batch_d;
+        // 使用定长 1000 字节的 Value
+        batch_d.Put(Key(CUID_D, i), std::string(1000, 'X'));
+        db->Write(WriteOptions(), &batch_d);
+        if (i % 500 == 0 && i > 0) db->Flush(FlushOptions()); // 制造多个 L0 文件
+    }
+    db->Flush(FlushOptions());
+    
+    // 2. 强行 Compact 到 L1，触发文件生成和切分
+    // 【修复 2：初始化 CompactRangeOptions，强制目标层级为 L1】
+    CompactRangeOptions cro_split;
+    cro_split.change_level = true;
+    cro_split.target_level = 1;
+    s = db->CompactRange(cro_split, nullptr, nullptr);
+    Check(s.ok(), "Large Compaction finished");
+    
+    // 3. 验证 L1 文件数量
+    int l1_files = NumL1(db);
+    std::cout << "L1 files after compaction: " << l1_files << std::endl;
+    Check(l1_files >= 2, "Compaction should split output into multiple L1 files");
+    
+    // 4. 严苛验证 GDCT 引用计数
+    int ref_d = GetRef(db, CUID_D);
+    std::cout << "CUID_D Ref Count: " << ref_d << std::endl;
+    Check(ref_d >= 2, "CUID_D should hold references to ALL split output files");
 
     std::cout << "\n===================================" << std::endl;
     std::cout << "Design Verification PASSED" << std::endl;

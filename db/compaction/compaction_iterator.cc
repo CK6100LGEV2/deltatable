@@ -7,6 +7,7 @@
 
 #include <iterator>
 #include <limits>
+#include <iostream>
 
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_builder.h"
@@ -463,6 +464,9 @@ void CompactionIterator::CheckHotspotFilters() {
 
   // 1. 提取当前 Key 的 CUID
   uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
+
+  fprintf(stderr, "[DEBUG] Key size: %zu, Extracted CUID: %lu, IsDeleted: %d\n", 
+         input_.key().size(), cuid, hotspot_manager_->GetDeleteTable().IsDeleted(cuid));
 
   if (cuid == current_cuid_ && cuid != 0) {
     return;

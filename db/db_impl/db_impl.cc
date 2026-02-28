@@ -2710,6 +2710,18 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     ReturnAndCleanupSuperVersion(cfd, sv);
 
     RecordInHistogram(stats_, BYTES_PER_READ, size);
+    // [Delta Fix]
+    // 如果读取成功，但该 CUID 在 GDCT 中被标记为删除，则强制返回 NotFound
+    if (s.ok() && hotspot_manager_) {
+        uint64_t cuid = hotspot_manager_->ExtractCUID(key);
+        if (cuid != 0 && hotspot_manager_->IsCuidDeleted(cuid)) {
+            // 如果需要的话，可以重置 value，防止内存泄露
+            if (get_impl_options.value) {
+                get_impl_options.value->Reset();
+            }
+            return Status::NotFound();
+        }
+    }
   }
   return s;
 }
