@@ -394,8 +394,7 @@ class CompactionJob {
       SubcompactionState* sub_compact, ColumnFamilyData* cfd,
       InternalIterator* input_iter, const CompactionFilter* compaction_filter,
       MergeHelper& merge, BlobFileResources& blob_resources,
-      const WriteOptions& write_options,
-      std::unordered_set<uint64_t>* local_involved_cuids);
+      const WriteOptions& write_options);
   std::pair<CompactionFileOpenFunc, CompactionFileCloseFunc> CreateFileHandlers(
       SubcompactionState* sub_compact, SubcompactionKeyBoundaries& boundaries);
   Status ProcessKeyValue(SubcompactionState* sub_compact, ColumnFamilyData* cfd,
@@ -565,8 +564,10 @@ class CompactionJob {
 
   std::shared_ptr<HotspotManager> hotspot_manager_;
   std::vector<uint64_t> input_file_numbers_;
+
+  // [Delta] 添加新的 Input 账本及锁 (支持多线程 SubCompaction)
   std::unordered_set<uint64_t> compaction_involved_cuids_;
-  std::mutex cuids_mutex_;
+  std::mutex input_files_mutex_;
   
   // [Delta] 记录 Output 文件号对应的 CUID 集合
   // Key: FileNumber, Value: Set of CUIDs

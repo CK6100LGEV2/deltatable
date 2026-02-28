@@ -2,6 +2,9 @@
 
 #pragma once
 #include <unordered_map>
+#include <map>              
+#include <unordered_set>    
+#include <iostream>
 #include <shared_mutex>
 #include <mutex>
 #include <vector>
@@ -46,12 +49,11 @@ class GlobalDeleteCountTable {
 
   int GetRefCount(uint64_t cuid) const;
 
-  // Compaction 原子更新：移除 Input 引用，添加 Output 引用，清理死数据
+  // Compaction 原子更新：精确的 Input/Output 双向映射
   void AtomicCompactionUpdate(
-      const std::unordered_set<uint64_t>& involved_cuids,
-      const std::vector<uint64_t>& input_files,
-      uint64_t output_file,
-      const std::unordered_set<uint64_t>& survivor_cuids);
+    const std::unordered_set<uint64_t>& involved_cuids,
+    const std::vector<uint64_t>& input_files,
+    const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids);
 
  private:
   mutable std::shared_mutex mutex_;

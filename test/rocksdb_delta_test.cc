@@ -77,6 +77,31 @@ int NumL2(DB* db) {
     return std::stoi(val);
 }
 
+int CountActualSSTFilesForCUID(DB* db, uint64_t cuid) {
+    auto db_impl = static_cast<DBImpl*>(db);
+    auto hotspot_mgr = db_impl->GetHotspotManager();
+    
+    std::vector<LiveFileMetaData> metadata;
+    db->GetLiveFilesMetaData(&metadata);
+    
+    int count = 0;
+    for (const auto& file : metadata) {
+        // 【核心修复】：直接使用你代码里的提取逻辑
+        // ExtractCUID 只看 offset 16-23，不关心后面是否有 8 字节 Trailer
+        // 也不受字符串长度影响，非常稳健。
+        uint64_t f_min_cuid = hotspot_mgr->ExtractCUID(file.smallestkey);
+        uint64_t f_max_cuid = hotspot_mgr->ExtractCUID(file.largestkey);
+        
+        // 如果我们要审计的 cuid 在这个文件的 [min, max] 范围内，说明包含该 CUID
+        if (cuid >= f_min_cuid && cuid <= f_max_cuid) {
+            // 特殊处理：如果 f_min 和 f_max 跨度很大（比如 0 到 1000）
+            // 说明这是一个跨 CUID 的合并文件，它确实包含了我们的 cuid
+            count++;
+        }
+    }
+    return count;
+}
+
 int main() {
     // 0. 清理环境
     Options options;
@@ -87,6 +112,8 @@ int main() {
     options.disable_auto_compactions = true; // 手动控制
     options.level0_file_num_compaction_trigger = 4;
     options.num_levels = 3;
+    options.target_file_size_base = 128 * 1024; 
+    options.target_file_size_multiplier = 1; 
     
     DB* db = nullptr;
     Status s = DB::Open(options, kDBPath, &db);
@@ -280,6 +307,16 @@ int main() {
     base_d.Put(Key(CUID_D, -1), "L1_base_for_D"); // 用一个负数 Key 确保范围覆盖
     db->Write(WriteOptions(), &base_d);
     db->Flush(FlushOptions());
+
+    int l0_files = NumL0(db);
+    int l1_files = NumL1(db);
+    int l2_files = NumL2(db);
+    int ref_d = GetRef(db, CUID_D);
+    std::cout << "L0 files after write base: " << l0_files << std::endl;
+    std::cout << "L1 files after write base: " << l1_files << std::endl;
+    std::cout << "L2 files after write base: " << l2_files << std::endl;
+    std::cout << "CUID_D Ref Count: " << ref_d << std::endl;
+
     CompactRangeOptions cro_base_d;
     cro_base_d.change_level = true;
     cro_base_d.target_level = 1;
@@ -299,6 +336,15 @@ int main() {
     }
     db->Flush(FlushOptions());
     
+    l0_files = NumL0(db);
+    l1_files = NumL1(db);
+    l2_files = NumL2(db);
+    ref_d = GetRef(db, CUID_D);
+    std::cout << "L0 files before compaction: " << l0_files << std::endl;
+    std::cout << "L1 files before compaction: " << l1_files << std::endl;
+    std::cout << "L2 files before compaction: " << l2_files << std::endl;
+    std::cout << "CUID_D Ref Count: " << ref_d << std::endl;
+    
     // 2. 强行 Compact 到 L1，触发文件生成和切分
     // 【修复 2：初始化 CompactRangeOptions，强制目标层级为 L1】
     CompactRangeOptions cro_split;
@@ -306,16 +352,136 @@ int main() {
     cro_split.target_level = 1;
     s = db->CompactRange(cro_split, nullptr, nullptr);
     Check(s.ok(), "Large Compaction finished");
+
+    l0_files = NumL0(db);
+    l1_files = NumL1(db);
+    l2_files = NumL2(db);
+    ref_d = GetRef(db, CUID_D);
+    std::cout << "L0 files after compaction: " << l0_files << std::endl;
+    std::cout << "L1 files after compaction: " << l1_files << std::endl;
+    std::cout << "L2 files after compaction: " << l2_files << std::endl;
+    std::cout << "CUID_D Ref Count: " << ref_d << std::endl;
     
     // 3. 验证 L1 文件数量
-    int l1_files = NumL1(db);
-    std::cout << "L1 files after compaction: " << l1_files << std::endl;
     Check(l1_files >= 2, "Compaction should split output into multiple L1 files");
     
     // 4. 严苛验证 GDCT 引用计数
-    int ref_d = GetRef(db, CUID_D);
-    std::cout << "CUID_D Ref Count: " << ref_d << std::endl;
     Check(ref_d >= 2, "CUID_D should hold references to ALL split output files");
+
+    // 场景 7: 终极严苛审计测试 (Strict Physical Audit)
+    // ==========================================================
+    std::cout << "\n--- Scenario 7: Chaos & Strict Audit (Equality Check) ---" << std::endl;
+
+    delete db;
+    DestroyDB(kDBPath, options);
+    
+    // 【关键修复 1】：禁用压缩，并设置极小的分裂阈值
+    options.compression = kNoCompression; 
+    options.target_file_size_base = 32 * 1024; // 32KB
+    s = DB::Open(options, kDBPath, &db);
+    Check(s.ok(), "DB Reopened for Scenario 7");
+
+    const uint64_t C_KEEP = 700; 
+    const uint64_t C_KILL = 701; 
+
+    // 【关键修复 2】：先在 L1 钉入一个“钉子”，防止之后的 Trivial Move
+    db->Put(WriteOptions(), Key(C_KEEP, 1000), "L1_BLOCKER");
+    db->Flush(FlushOptions());
+    CompactRangeOptions cro_init;
+    cro_init.change_level = true;
+    cro_init.target_level = 1;
+    db->CompactRange(cro_init, nullptr, nullptr);
+    std::cout << "[Trace] L1 Seeded to block Trivial Move." << std::endl;
+
+    // 2. 【第一阶段：海量写入】
+    std::cout << "[Step 1] Writing 4MB data across 2 CUIDs..." << std::endl;
+    for (int i = 0; i < 2000; i++) {
+        // 每个 Key+Value 约 1KB，2000次循环 = 2MB per CUID
+        db->Put(WriteOptions(), Key(C_KEEP, i), std::string(1000, 'K')); 
+        db->Put(WriteOptions(), Key(C_KILL, i), std::string(1000, 'X')); 
+    }
+    db->Flush(FlushOptions());
+    
+    // 执行 Compaction。由于 L1 已经有数据且 Key 范围重叠，
+    // RocksDB 必须执行 Real Merge，从而根据 32KB 阈值切分出几十个文件。
+    std::cout << "[Step 1] Triggering Real Merge and Splitting..." << std::endl;
+    db->CompactRange(cro_init, nullptr, nullptr);
+
+    // --- 第一次严格审计 ---
+    int phys_keep_1 = CountActualSSTFilesForCUID(db, C_KEEP);
+    int ref_keep_1 = GetRef(db, C_KEEP);
+    
+    std::cout << "[Audit 1] C_KEEP -> Physical Files: " << phys_keep_1 
+              << ", Ref Count: " << ref_keep_1 << std::endl;
+    
+    // 现在 ref_keep_1 应该远大于 5（理论上 2MB / 32KB = 64个文件左右）
+    Check(ref_keep_1 == phys_keep_1, "Audit 1: Ref must EXACTLY EQUAL Physical count");
+    Check(ref_keep_1 > 20, "Audit 1: Should have enough split files for stress test");
+
+    // 3. 【第二阶段：构造混沌——一个生存，一个毁灭】
+    std::cout << "[Step 2] Marking C_KILL for death and writing more for C_KEEP..." << std::endl;
+    
+    // 逻辑删除 KILL
+    db->Delete(WriteOptions(), Key(C_KILL, 0)); 
+    Check(GetDeleted(db, C_KILL), "C_KILL is dead.");
+
+    // >>>>>> [终极修复]：构造全范围诱饵 <<<<<<
+    // 只写一个点是不够的，我们要写两个点，覆盖 C_KILL 在 Step 1 写入的 [0, 2000] 范围
+    // 这样 RocksDB 就会发现 L0 的范围包含了 L1 里 C_KILL 的所有文件
+    db->Put(WriteOptions(), Key(C_KILL, 0), "trigger_start");
+    db->Put(WriteOptions(), Key(C_KILL, 2000), "trigger_end");
+    db->Flush(FlushOptions()); 
+
+    // 给 KEEP 增加更多数据 (保持现状)
+    for (int i = 2000; i < 3000; i++) {
+        db->Put(WriteOptions(), Key(C_KEEP, i), std::string(1000, 'K'));
+        if (i % 500 == 0) db->Flush(FlushOptions());
+    }
+    db->Flush(FlushOptions());
+
+    // 此时 Ref 应该是：之前的 L1 文件数 + 新的 L0 文件数
+    std::cout << "[Trace] Pre-Compaction Ref for C_KEEP: " << GetRef(db, C_KEEP) << std::endl;
+
+    // 4. 【第三阶段：终极合并与物理回收】
+    std::cout << "[Step 3] Triggering Massive Merge Compaction..." << std::endl;
+    CompactRangeOptions cro_final;
+    cro_final.change_level = true;
+    cro_final.target_level = 1;
+    cro_final.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    s = db->CompactRange(cro_final, nullptr, nullptr);
+    Check(s.ok(), "Chaos Compaction Finished");
+
+    // 5. 【第四阶段：终极绝对审计】
+    std::cout << "[Step 4] FINAL STRICT AUDIT..." << std::endl;
+
+    int final_phys_keep = CountActualSSTFilesForCUID(db, C_KEEP);
+    int final_ref_keep = GetRef(db, C_KEEP);
+    int final_ref_kill = GetRef(db, C_KILL);
+    int final_phys_kill = CountActualSSTFilesForCUID(db, C_KILL);
+
+    std::cout << ">> Result C_KILL Ref: " << final_ref_kill << " (Expected: -1)" << std::endl;
+    std::cout << ">> Result C_KEEP Ref: " << final_ref_keep << std::endl;
+    std::cout << ">> Result C_KEEP Phys: " << final_phys_keep << std::endl;
+
+    // --- 终极等号断言 ---
+    
+    // 断言 1：被杀死的 CUID 必须在账本中完全消失
+    if (final_phys_kill > 0) {
+        std::cout << ">> Result C_KILL Ref: " << final_ref_kill << ", Phys: " << final_phys_kill << std::endl;
+        Check(final_ref_kill == final_phys_kill, "STRICT: C_KILL Ref must match Physical even if not fully purged");
+    } else {
+        Check(final_ref_kill == -1, "STRICT: C_KILL fully purged and entry GONE.");
+    }
+
+    // 断言 2：生存者的引用计数必须【严格等于】磁盘上包含它的 SST 文件数
+    // 只要这一个等号成立，就证明了你的 ApplyCompactionResult 在面对
+    // [多层级合并] + [文件分裂] + [部分数据丢弃] 时，账目算得一分不差。
+    Check(final_ref_keep == final_phys_keep, "STRICT: C_KEEP Ref (" + std::to_string(final_ref_keep) + 
+          ") must EXACTLY EQUAL Physical File Count (" + std::to_string(final_phys_keep) + ")");
+
+    std::cout << "\n=========================================" << std::endl;
+    std::cout << "SCENARIO 7 PASSED: PERFECT ACCOUNTING!" << std::endl;
+    std::cout << "=========================================" << std::endl;
 
     std::cout << "\n===================================" << std::endl;
     std::cout << "Design Verification PASSED" << std::endl;

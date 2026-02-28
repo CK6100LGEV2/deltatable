@@ -76,7 +76,7 @@ bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
   return table_.find(cuid) != table_.end();
 }
 
-void GlobalDeleteCountTable::AtomicCompactionUpdate(
+/*void GlobalDeleteCountTable::AtomicCompactionUpdate(
     const std::unordered_set<uint64_t>& involved_cuids,
     const std::vector<uint64_t>& input_files,
     uint64_t output_file,
@@ -105,6 +105,42 @@ void GlobalDeleteCountTable::AtomicCompactionUpdate(
         // 3. 垃圾回收检查 (The GC)
         // 如果引用归零，且已被逻辑删除，说明物理数据已彻底清除，回收内存条目
         if (entry.tracked_phys_ids.empty() && entry.is_deleted) {
+            table_.erase(it);
+        }
+    }
+}*/
+
+void GlobalDeleteCountTable::AtomicCompactionUpdate(
+    const std::unordered_set<uint64_t>& involved_cuids,
+    const std::vector<uint64_t>& input_files,
+    const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids) {
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    // 1. 处理输出 (加新账)：完美解决文件分裂！
+    for (const auto& pair : output_file_to_cuids) {
+        uint64_t out_id = pair.first;
+        std::cout << "[GDCT-TRACE] Adding Ref: CUID=" << *pair.second.begin() 
+                  << " -> File=" << pair.first << std::endl;
+        for (uint64_t cuid : pair.second) {
+            table_[cuid].tracked_phys_ids.insert(out_id);
+        }
+    }
+
+    // 2. 处理输入 (消旧账)：大道至简，安全移除所有被销毁的文件
+    for (uint64_t cuid : involved_cuids) {
+        auto it = table_.find(cuid);
+        if (it == table_.end()) continue;
+
+        // 尝试移除本次 Compaction 销毁的所有 Input 文件
+        for (uint64_t old_fid : input_files) {
+            std::cout << "[GDCT-TRACE] Removing Ref: CUID=" << cuid 
+                          << " -> File=" << old_fid << std::endl;
+            it->second.tracked_phys_ids.erase(old_fid);
+        }
+
+        // 3. 垃圾回收检查
+        if (it->second.tracked_phys_ids.empty() && it->second.is_deleted) {
             table_.erase(it);
         }
     }

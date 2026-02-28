@@ -72,6 +72,10 @@ class SequenceIterWrapper : public InternalIterator {
     assert(Valid());
     return inner_iter_->IsDeleteRangeSentinelKey();
   }
+  // [Delta Fix] 添加这个函数，将调用转发给内部迭代器
+  uint64_t GetPhysicalId() override {
+    return inner_iter_->GetPhysicalId();
+  }
 
  private:
   InternalKeyComparator icmp_;
@@ -535,6 +539,7 @@ class CompactionIterator {
   bool skip_current_cuid_ = false; // 缓存当前cuid是否需要被跳过
   std::vector<uint64_t> input_file_numbers_;
   std::unordered_set<uint64_t>* involved_cuids_ = nullptr;
+  uint64_t current_file_id_ = 0; // 记录当前扫描的物理文件号
   // for delta
   std::shared_ptr<HotspotManager> hotspot_manager_;
 

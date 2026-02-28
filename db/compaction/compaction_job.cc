@@ -1449,8 +1449,7 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
     SubcompactionState* sub_compact, ColumnFamilyData* cfd,
     InternalIterator* input, const CompactionFilter* compaction_filter,
     MergeHelper& merge, BlobFileResources& blob_resources,
-    const WriteOptions& write_options,
-    std::unordered_set<uint64_t>* local_involved_cuids) {
+    const WriteOptions& write_options) {
   CreateBlobFileBuilder(sub_compact, cfd, blob_resources, write_options);
 
   const std::string* const full_history_ts_low =
@@ -1484,11 +1483,6 @@ std::unique_ptr<CompactionIterator> CompactionJob::CreateCompactionIterator(
       db_options_.info_log, full_history_ts_low, preserve_seqno_after_,
       hotspot_manager,
       input_file_numbers);
-
-  // for delta    
-  if (c_iter && hotspot_manager_) {
-      c_iter->SetInvolvedCuids(local_involved_cuids);
-  }
 
   return c_iter;
 }
@@ -1806,10 +1800,11 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       compact_->compaction->level(), db_options_.stats);
   BlobFileResources blob_resources;
 
-  auto c_iter =
-      CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter,
-                               merge, blob_resources, write_options, &local_involved_cuids);
+  auto c_iter = CreateCompactionIterator(sub_compact, cfd, input_iter, compaction_filter, merge, blob_resources, write_options);
   assert(c_iter);
+  if (c_iter && hotspot_manager_) {
+      c_iter->SetInvolvedCuids(&local_involved_cuids);
+  }
   c_iter->SeekToFirst();
 
   TEST_SYNC_POINT("CompactionJob::Run():Inprogress");
@@ -1826,10 +1821,8 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   status = FinalizeProcessKeyValueStatus(cfd, input_iter, c_iter.get(), status);
 
   if (!local_involved_cuids.empty()) {
-      // 加锁，因为 ProcessKeyValueCompaction 可能在多个线程中并发运行
-      std::lock_guard<std::mutex> lock(cuids_mutex_);
-      compaction_involved_cuids_.insert(local_involved_cuids.begin(), 
-                                        local_involved_cuids.end());
+      std::lock_guard<std::mutex> lock(input_files_mutex_);
+      compaction_involved_cuids_.insert(local_involved_cuids.begin(), local_involved_cuids.end());
   }
 
   FinalizeSubcompaction(sub_compact, status, open_file_func, close_file_func,
@@ -2297,8 +2290,21 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           compaction_involved_cuids_.clear();
           return status; 
       }
+
+      std::cout << "[GDCT-DEBUG] Install Phase: " 
+                  << "Physical New Files: " << new_files.size() 
+                  << ", Ledger(output_cuids_) size: " << output_cuids_.size() << std::endl;
+
+       // 如果两者不相等，说明漏记了！
+      if (new_files.size() != output_cuids_.size()) {
+          std::cout << "[GDCT-FATAL] Ledger Mismatch! One or more output files were not registered!" << std::endl;
+      }
+
+       std::cout << "[GDCT-DEBUG] Compaction Plan: Destroying " << input_file_numbers_.size() << " files: ";
+      for (auto id : input_file_numbers_) std::cout << id << " ";
+      std::cout << std::endl;
       
-      if (!new_files.empty()) {
+      /*if (!new_files.empty()) {
           for (const auto& file_meta : new_files) {
               // 这里的变量只在循环内部定义，避免 Shadow 报错
               uint64_t output_id = file_meta.second.fd.GetNumber();
@@ -2326,7 +2332,12 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
               0,                  
               {}              
           );
-      }
+      }*/
+      hotspot_manager_->ApplyCompactionResult(
+          compaction_involved_cuids_, 
+          input_file_numbers_,
+          output_cuids_
+      );
 
       // 清理临时状态
       compaction_involved_cuids_.clear();
@@ -2512,6 +2523,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
 void CompactionJob::CleanupCompaction() {
   if (hotspot_manager_) {
       compaction_involved_cuids_.clear();
+      output_cuids_.clear();
       input_file_numbers_.clear(); 
   }
 

@@ -465,15 +465,18 @@ void CompactionIterator::CheckHotspotFilters() {
   // 1. 提取当前 Key 的 CUID
   uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
 
-  fprintf(stderr, "[DEBUG] Key size: %zu, Extracted CUID: %lu, IsDeleted: %d\n", 
-         input_.key().size(), cuid, hotspot_manager_->GetDeleteTable().IsDeleted(cuid));
+  // fprintf(stderr, "[DEBUG] Key size: %zu, Extracted CUID: %lu, IsDeleted: %d\n",
+  //        input_.key().size(), cuid, hotspot_manager_->GetDeleteTable().IsDeleted(cuid));
 
   if (cuid == current_cuid_ && cuid != 0) {
     return;
   }
 
+  if (cuid != current_cuid_) {
+      skip_current_cuid_ = false;
+  }
+
   current_cuid_ = cuid;
-  skip_current_cuid_ = false;
   if (cuid == 0) return;
 
   if (involved_cuids_) {

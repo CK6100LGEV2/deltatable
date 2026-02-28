@@ -77,9 +77,8 @@ void HotspotManager::RegisterFileRefs(uint64_t file_number, const std::unordered
 void HotspotManager::ApplyCompactionResult(
     const std::unordered_set<uint64_t>& involved_cuids,
     const std::vector<uint64_t>& input_files,
-    uint64_t output_file,
-    const std::unordered_set<uint64_t>& survivor_cuids) {
+    const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids) {
     
-    delete_table_.AtomicCompactionUpdate(involved_cuids, input_files, output_file, survivor_cuids);
+    delete_table_.AtomicCompactionUpdate(involved_cuids, input_files, output_file_to_cuids);
 }
 }  // namespace ROCKSDB_NAMESPACE
