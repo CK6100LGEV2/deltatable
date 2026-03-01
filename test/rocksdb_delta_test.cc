@@ -122,28 +122,53 @@ int main() {
     const uint64_t CUID_A = 100; // 测试 GC
     const uint64_t CUID_B = 200; // 测试 Trivial Move
 
+    // 场景 1: 验证 MemTable 追踪与逻辑删除闭环
     // ==========================================================
-    // 场景 1: 验证 Flush 注册 (Ref Count 0 -> 1)
-    // ==========================================================
-    std::cout << "\n--- Scenario 1: Flush Registration ---" << std::endl;
+    std::cout << "\n--- Scenario 1: MemTable Tracking & Transfer ---" << std::endl;
+
+    // 1. 写入数据到 MemTable
+    db->Put(WriteOptions(), Key(CUID_A, 1), "val_A");
+    db->Put(WriteOptions(), Key(CUID_B, 1), "val_B");
     
-    WriteBatch batch;
-    batch.Put(Key(CUID_A, 1), "val1");
-    batch.Put(Key(CUID_B, 1), "val1");
-    s = db->Write(WriteOptions(), &batch);
-    Check(s.ok(), "Write Memtable");
+    // 2. 【关键】：触发一次读取。
+    // 这会导致 DBIter 扫描 MemTable，并将 MemTable 的内存地址注册到 GDCT。
+    std::string val1;
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    it->Seek(Key(CUID_A, 1)); 
+    it->Seek(Key(CUID_B, 1));
+    if (it->Valid()) {
+        std::cout << "Read key: " << it->key().ToString() << std::endl;
+    }
 
-    // 此时在 Memtable，引用计数应该是 0 (或者您实现了 Memtable 追踪，那就是 1)
-    // 假设只追踪 SST：
-    Check(GetRef(db, CUID_A) <= 0, "Before flush, Ref should be 0 (if only tracking SST)");
+    // 3. 验证此时引用计数是否为 1 (代表 MemTable 正在被追踪)
+    int ref_before_flush = GetRef(db, CUID_A);
+    Check(ref_before_flush == 1, "GDCT should track MemTable! Ref: " + std::to_string(ref_before_flush));
+    Check(GetRef(db, CUID_B) == 1, "CUID_B should be tracked in MemTable");
 
+    // 4. 执行逻辑删除 (不写 Tombstone，只改 GDCT)
+    s = db->Delete(WriteOptions(), Key(CUID_A, 1));
+    Check(s.ok(), "Logical Delete CUID_A (Still in MemTable)");
+
+    // 5. 【验证逻辑删除是否即时生效】：
+    // 数据虽然还在内存里，但 Get 必须返回 NotFound
+    s = db->Get(ReadOptions(), Key(CUID_A, 1), &val1);
+    Check(s.IsNotFound(), "Data in MemTable should be hidden by GDCT after logical delete");
+
+    // 6. 执行 Flush (触发 MemTable -> SST 的引用转移)
+    // 这里会执行 Issue 3 的修复代码：Untrack(MemTable_Addr) + Register(SST_ID)
+    std::cout << "Flushing MemTable to SST..." << std::endl;
     s = db->Flush(FlushOptions());
     Check(s.ok(), "Flush to L0");
 
-    // 关键验证点：Flush 后，CUID_A 必须被注册，且引用计数为 1
-    int ref_a = GetRef(db, CUID_A);
-    Check(ref_a == 1, "After flush, CUID_A Ref should be 1. Actual: " + std::to_string(ref_a));
-    Check(NumL0(db) == 1, "L0 file count should be 1");
+    // 7. 【核心审计点】：验证引用计数是否依然为 1
+    // 如果没有 Issue 3 的修复：旧 MemTable 地址没删，新 SST 又加了 1，Ref 会变成 2 (报错)
+    // 如果有 Issue 3 的修复：账目对平，Ref 应该是 1
+    int ref_after_flush = GetRef(db, CUID_A);
+    Check(ref_after_flush == 1, "Ref should be EXACTLY 1 after Flush (Atomic Transfer). Actual: " + std::to_string(ref_after_flush));
+
+    // 8. 再次验证逻辑删除在持久化后依然有效
+    s = db->Get(ReadOptions(), Key(CUID_A, 1), &val1);
+    Check(s.IsNotFound(), "Data in SST should still be hidden by GDCT");
 
     // ==========================================================
     // 场景 2: 验证逻辑删除 (No Tombstone)
@@ -169,6 +194,8 @@ int main() {
     // CUID_B 没删，应该还能读到
     s = db->Get(ReadOptions(), Key(CUID_B, 1), &val);
     Check(s.ok(), "Get() should find CUID_B");
+    Check(val == "val_B", "CUID_B value should be correct"); // 进一步校验值
+    Check(GetDeleted(db, CUID_B) == false, "CUID_B should NOT be marked deleted");
 
     // ==========================================================
     // 场景 3: 验证 Trivial Move (Smart Picker)
@@ -372,6 +399,7 @@ int main() {
     // ==========================================================
     std::cout << "\n--- Scenario 7: Chaos & Strict Audit (Equality Check) ---" << std::endl;
 
+    it.reset();
     delete db;
     DestroyDB(kDBPath, options);
     
@@ -479,9 +507,83 @@ int main() {
     Check(final_ref_keep == final_phys_keep, "STRICT: C_KEEP Ref (" + std::to_string(final_ref_keep) + 
           ") must EXACTLY EQUAL Physical File Count (" + std::to_string(final_phys_keep) + ")");
 
-    std::cout << "\n=========================================" << std::endl;
-    std::cout << "SCENARIO 7 PASSED: PERFECT ACCOUNTING!" << std::endl;
-    std::cout << "=========================================" << std::endl;
+    std::cout << "SCENARIO 7 PASSED!" << std::endl;
+
+    // 场景 8: 混沌重生与多线程并发审计 (Stress & Reincarnation)
+    // ==========================================================
+    std::cout << "\n--- Scenario 8: Multi-threaded Stress & Reincarnation ---" << std::endl;
+
+    // 1. 开启多线程子压缩 (Sub-compactions)
+    // 这会测试 CompactionJob 中 output_cuids_mutex_ 的安全性
+    options.max_subcompactions = 8; 
+    delete db;
+    s = DB::Open(options, kDBPath, &db);
+
+    const uint64_t C_PHOENIX = 800; // 不死鸟 CUID
+
+    // [Step 1] 写入并彻底删除 C_PHOENIX，诱发 Real Merge
+    std::cout << "[Step 1] Writing and purging C_PHOENIX..." << std::endl;
+    db->Put(WriteOptions(), Key(C_PHOENIX, 1), "old_life");
+    db->Flush(FlushOptions());
+
+    // 此时引用计数为 1 (L0 文件)
+    Check(GetRef(db, C_PHOENIX) == 1, "C_PHOENIX exists in L0");
+
+    // 逻辑删除
+    db->Delete(WriteOptions(), Key(C_PHOENIX, 1));
+    Check(GetDeleted(db, C_PHOENIX), "C_PHOENIX marked deleted");
+
+    // 【核心修复】：强制全量合并。
+    // 使用 kForce 确保即使可以 Trivial Move，也必须经过 Iterator 重写文件。
+    CompactRangeOptions cro8;
+    cro8.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+    
+    // 执行全量 Compaction
+    s = db->CompactRange(cro8, nullptr, nullptr); 
+    Check(s.ok(), "Full GC Compaction finished");
+
+    // 验证：RefCount 归零，条目消失
+    int final_ref = GetRef(db, C_PHOENIX);
+    Check(final_ref == -1, "C_PHOENIX purged via Forced Compaction. Actual Ref: " + std::to_string(final_ref));
+
+    // [Step 2] 立即重生 (Reincarnation)
+    // 验证系统不会因为残留的 is_deleted 标记误杀新数据
+    std::cout << "[Step 2] Reincarnating C_PHOENIX with new data..." << std::endl;
+    db->Put(WriteOptions(), Key(C_PHOENIX, 1), "new_life");
+    db->Flush(FlushOptions());
+    
+    std::string phoenix_val;
+    s = db->Get(ReadOptions(), Key(C_PHOENIX, 1), &phoenix_val);
+    Check(s.ok() && phoenix_val == "new_life", "Reincarnated CUID must be readable!");
+    Check(GetDeleted(db, C_PHOENIX) == false, "New CUID must NOT be marked deleted");
+
+    // [Step 3] 多线程并发分裂压力测试
+    // 同时写入 10 个 CUID，每个 CUID 产生海量数据，强制 Sub-compactions 并行工作
+    std::cout << "[Step 3] Launching multi-threaded sub-compaction stress..." << std::endl;
+    for (int c = 801; c <= 810; c++) {
+        for (int i = 0; i < 500; i++) {
+            db->Put(WriteOptions(), Key(c, i), std::string(1000, 'S'));
+        }
+    }
+    db->Flush(FlushOptions());
+
+    // 触发并行 Compaction
+    CompactRangeOptions cro_stress;
+    cro_stress.max_subcompactions = 8;
+    db->CompactRange(cro_stress, nullptr, nullptr);
+
+    // [Final Audit] 遍历所有 10 个 CUID，执行物理审计
+    bool stress_pass = true;
+    for (int c = 801; c <= 810; c++) {
+        int p_count = CountActualSSTFilesForCUID(db, c);
+        int r_count = GetRef(db, c);
+        if (p_count != r_count) {
+            std::cerr << "Stress Audit Failed for CUID " << c 
+                      << ": Phys=" << p_count << " Ref=" << r_count << std::endl;
+            stress_pass = false;
+        }
+    }
+    Check(stress_pass, "Multi-threaded Sub-compaction Audit Passed!");
 
     std::cout << "\n===================================" << std::endl;
     std::cout << "Design Verification PASSED" << std::endl;

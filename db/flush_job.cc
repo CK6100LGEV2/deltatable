@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <vector>
+#include <iostream>
 
 #include "db/builder.h"
 #include "db/db_iter.h"
@@ -337,6 +338,16 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
           
           if (!committed_cuids_.empty()) {
               db_options_.hotspot_manager->RegisterFileRefs(new_file_number, committed_cuids_);
+              // 移除旧 MemTable 的账单 (-1)
+              // 这一步确保了：即使 Flush 前被 Scan 过的 CUID，账目也能对平
+              for (auto m : mems_) {
+                uint64_t actual_mem_id = reinterpret_cast<uint64_t>(m);
+                // 调试输出确认地址
+                fprintf(stderr, "[GDCT] Untracking Actual MemTable: %lu\n", actual_mem_id);
+                for (uint64_t cuid : committed_cuids_) {
+                    db_options_.hotspot_manager->GetDeleteTable().UntrackPhysicalUnit(cuid, actual_mem_id);
+                }
+            }
           }
       }
     }

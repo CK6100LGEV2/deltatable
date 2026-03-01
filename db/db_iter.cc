@@ -542,6 +542,7 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
 
                   // 维护引用计数
                 if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                  std::cout<<"cuid:"<<cuid<<" mem_id:"<<phys_id<<std::endl;
                   hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
                   delta_ctx_.visited_units_for_cuid.insert(phys_id);
                   // // 记录该 Delta 片段在原始 LSM 中的位置？delta 列表

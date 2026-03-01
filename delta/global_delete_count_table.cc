@@ -21,9 +21,9 @@ void GlobalDeleteCountTable::UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id
   if (it != table_.end()) {
     it->second.tracked_phys_ids.erase(phys_id);
     // 如果计数归零且已标记删除的清理？
-    // if (it->second.is_deleted && it->second.tracked_phys_ids.empty()) {
-    //     table_.erase(it);
-    // }
+    if (it->second.is_deleted && it->second.tracked_phys_ids.empty()) {
+        table_.erase(it);
+    }
   }
 }
 
@@ -74,6 +74,14 @@ int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {
 bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   return table_.find(cuid) != table_.end();
+}
+
+void GlobalDeleteCountTable::ClearDeletedFlag(uint64_t cuid) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto it = table_.find(cuid);
+    if (it != table_.end()) {
+        it->second.is_deleted = false; // 撤销删除标记，给予新生
+    }
 }
 
 /*void GlobalDeleteCountTable::AtomicCompactionUpdate(

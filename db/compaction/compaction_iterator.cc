@@ -467,6 +467,9 @@ void CompactionIterator::CheckHotspotFilters() {
 
   // fprintf(stderr, "[DEBUG] Key size: %zu, Extracted CUID: %lu, IsDeleted: %d\n",
   //        input_.key().size(), cuid, hotspot_manager_->GetDeleteTable().IsDeleted(cuid));
+  if (involved_cuids_) {
+      involved_cuids_->insert(cuid);
+  }
 
   if (cuid == current_cuid_ && cuid != 0) {
     return;
@@ -478,10 +481,6 @@ void CompactionIterator::CheckHotspotFilters() {
 
   current_cuid_ = cuid;
   if (cuid == 0) return;
-
-  if (involved_cuids_) {
-      involved_cuids_->insert(cuid);
-  }
 
   // c)	当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
   // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
