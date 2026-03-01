@@ -23,6 +23,7 @@
 #include "db/range_del_aggregator.h"
 #include "db/table_cache.h"
 #include "db/version_edit.h"
+#include "delta/hotspot_manager.h"
 #include "file/file_util.h"
 #include "file/filename.h"
 #include "file/read_write_util.h"
@@ -75,7 +76,7 @@ Status BuildTable(
     Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
     BlobFileCompletionCallback* blob_callback, Version* version,
     uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
-    InternalStats::CompactionStats* flush_stats, std::unordered_set<uint64_t>* output_contained_cuids) {
+    InternalStats::CompactionStats* flush_stats, std::unordered_set<uint64_t>* output_contained_cuids, std::shared_ptr<HotspotManager> hotspot_manager) {
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -219,6 +220,18 @@ Status BuildTable(
       ParsedInternalKey ikey = c_iter.ikey();
       Slice key_after_flush = key;
       Slice value_after_flush = value;
+
+      /*// [Delta Fix] Flush 期间的 MVCC 过滤
+      if (hotspot_manager) {
+          uint64_t cuid = hotspot_manager->ExtractCUID(ikey.user_key);
+          
+          // 检查该版本是否已被删除
+          // Flush 不受快照限制，使用 kMaxSequenceNumber 作为 read_seq
+          if (cuid != 0 && hotspot_manager->GetDeleteTable().IsDeleted(cuid, kMaxSequenceNumber, ikey.sequence)) {
+             // 它是垃圾，直接丢弃，不写 SST
+             continue; 
+          }
+      }*/
 
       if (ikey.type == kTypeValuePreferredSeqno) {
         auto [unpacked_value, unix_write_time] =
@@ -379,16 +392,6 @@ Status BuildTable(
         *table_properties = tp;
       }
 
-      /*// [Delta Fix] 内部闭环：在 Builder 销毁前注册 CUID
-      if (hotspot_manager) {
-          // 这里必须使用 dynamic_cast，因为 builder 是 TableBuilder 基类
-          auto* bb_builder = dynamic_cast<BlockBasedTableBuilder*>(builder);
-          if (bb_builder) {
-              const auto& cuids = bb_builder->GetContainedCUIDs();
-              // 注册文件引用计数
-              hotspot_manager->RegisterFileRefs(meta->fd.GetNumber(), cuids);
-          }
-      }*/
       if (output_contained_cuids) {
           auto* bb_builder = static_cast<BlockBasedTableBuilder*>(builder);
           if (bb_builder) {

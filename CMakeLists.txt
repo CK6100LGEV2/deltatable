@@ -1699,3 +1699,6 @@ endif()
 # for delta
 add_executable(rocksdb_delta_test test/rocksdb_delta_test.cc db/db_test_util.cc)
 target_link_libraries(rocksdb_delta_test rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+
+add_executable(delta_snapshot_test test/delta_snapshot_test.cc db/db_test_util.cc)
+target_link_libraries(delta_snapshot_test rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

@@ -8,6 +8,8 @@
 #include "rocksdb/options.h"
 #include "db/db_impl/db_impl.h"
 #include "delta/hotspot_manager.h"
+#include "rocksdb/types.h" 
+#include "db/dbformat.h"
 
 using namespace ROCKSDB_NAMESPACE;
 
@@ -50,10 +52,17 @@ int GetRef(DB* db, uint64_t cuid) {
     return mgr->GetDeleteTable().GetRefCount(cuid);
 }
 
-// 获取是否逻辑删除
+// 获取是否逻辑删除 (测试辅助函数)
 bool GetDeleted(DB* db, uint64_t cuid) {
     auto mgr = static_cast<DBImpl*>(db)->GetHotspotManager();
-    return mgr->GetDeleteTable().IsDeleted(cuid);
+    
+    // 参数 1: cuid
+    // 参数 2: visible_seq -> 传入 kMaxSequenceNumber (上帝视角，看当前最新状态)
+    // 参数 3: found_seq   -> 传入 0 (假设我们在查询最老版本的数据是否被删除)
+    
+    // 逻辑原理：(kMax >= del_seq) 且 (0 <= del_seq) 永远为真
+    // 只要该 CUID 曾被 MarkDeleted 过，这个调用就会返回 true
+    return mgr->GetDeleteTable().IsDeleted(cuid, kMaxSequenceNumber, 0);
 }
 
 // 获取 L0 文件数量
@@ -249,51 +258,45 @@ int main() {
     
     const uint64_t CUID_C = 300;
     
-    // 【步骤 1：在 L1 牢牢钉入一个底座文件】
-    WriteBatch base_batch;
-    base_batch.Put(Key(CUID_C, 1), "L1_BASE_DATA");
-    db->Write(WriteOptions(), &base_batch);
+    // 【步骤 1：在 L1 铺设底座】
+    WriteBatch l1_base_batch;
+    l1_base_batch.Put(Key(CUID_C, 1), "base_data_in_L1");
+    db->Write(WriteOptions(), &l1_base_batch);
     db->Flush(FlushOptions());
     
     CompactRangeOptions cro_base;
     cro_base.change_level = true;
     cro_base.target_level = 1;
-    db->CompactRange(cro_base, nullptr, nullptr); // 压入 L1
-    
-    std::cout << "[Trace] After Base Setup -> L0: " << NumL0(db) << " L1: " << NumL1(db) << std::endl;
+    s = db->CompactRange(cro_base, nullptr, nullptr);
     Check(GetRef(db, CUID_C) == 1, "Base Ref should be 1");
 
-    // 【步骤 2：对 CUID_C 下达必杀令（逻辑删除）】
-    db->Delete(WriteOptions(), Key(CUID_C, 1));
-    Check(GetDeleted(db, CUID_C), "CUID_C marked deleted in GDCT");
-
-    // 【步骤 3：在 L0 写入重叠的幽灵数据】
-    // 此时 L1 有 CUID_C_1，L0 又来一个 CUID_C_1。绝对重叠！神仙也无法 Trivial Move！
-    WriteBatch ghost_batch;
-    ghost_batch.Put(Key(CUID_C, 1), "L0_GHOST_DATA");
-    db->Write(WriteOptions(), &ghost_batch);
+    // 【步骤 2：在 L0 写入重叠的幽灵数据】
+    // 注意：此时 CUID_C 还是合法的！所以 Flush 拦截器会放行！
+    WriteBatch l0_ghost_batch;
+    l0_ghost_batch.Put(Key(CUID_C, 1), "ghost_data_in_L0");
+    db->Write(WriteOptions(), &l0_ghost_batch);
     db->Flush(FlushOptions());
     
     std::cout << "[Trace] After Ghost Setup -> L0: " << NumL0(db) << " L1: " << NumL1(db) << std::endl;
+    // 此时数据合法落盘，Ref 必然是 2
     Check(GetRef(db, CUID_C) == 2, "Ghost Ref should be 2");
 
-    // 【步骤 4：发起最后的总攻 (强制跨层级合并)】
-    std::cout << "Triggering inescapable Merge Compaction..." << std::endl;
+    // 【步骤 3：关门打狗 (下达逻辑删除指令)】
+    // 数据已经在磁盘上了，我们现在告诉 GDCT：它们全变垃圾了！
+    db->Delete(WriteOptions(), Key(CUID_C, 1));
+    Check(GetDeleted(db, CUID_C), "CUID_C marked deleted in GDCT");
+
+    // 【步骤 4：触发全量 GC】
+    // RocksDB 发现 L0 和 L1 有重叠，启动 CompactionIterator。
+    // Iterator 发现 CUID_C IsDeleted=true，把它们全部丢弃！产生 Zero Outputs！
+    std::cout << "Triggering Compaction for fully deleted CUID..." << std::endl;
     CompactRangeOptions cro_full_gc;
-    // 不设 target_level，让它在所有层级发生碰撞
     s = db->CompactRange(cro_full_gc, nullptr, nullptr); 
     Check(s.ok(), "Full GC Compaction finished");
     
-    std::cout << "[Trace] After Full GC -> L0: " << NumL0(db) << " L1: " << NumL1(db) << std::endl;
-
-    // 【步骤 5：验证 GDCT 彻底清空】
+    // 【步骤 5：严苛验证】
     int ref_c = GetRef(db, CUID_C);
-    if (ref_c == -1) {
-        Check(true, "CUID_C fully GC'ed even with ZERO output files!");
-    } else {
-        std::cerr << "[FAIL] CUID_C still exists. Actual Ref: " << ref_c << std::endl;
-        exit(1);
-    }
+    Check(ref_c == -1, "CUID_C fully GC'ed even with ZERO output files. Actual Ref: " + std::to_string(ref_c));
 
 
     // 场景 6: 多文件分裂测试 (Multi-File Output)

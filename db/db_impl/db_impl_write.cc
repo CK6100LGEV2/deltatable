@@ -92,8 +92,23 @@ Status DBImpl::Delete(const WriteOptions& write_options,
     return s;
   }
   // for delta
-  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
-    return Status::OK();
+  if (hotspot_manager_) {
+    // 1. 加锁，确保序列号分配的原子性
+    InstrumentedMutexLock l(&mutex_);
+
+    // 2. 获取当前时钟并 +1，模拟产生一个新的版本号
+    SequenceNumber seq = versions_->LastSequence() + 1;
+
+    // 3. 将系统的全局时钟推向未来
+    // 这一步至关重要：它保证了此后的 Get(当前读) 拿到的 sequence_ 至少是这个 seq
+    versions_->SetLastSequence(seq);
+    versions_->SetLastAllocatedSequence(seq);
+    versions_->SetLastPublishedSequence(seq);
+
+    // 4. 调用拦截器，记录这个“死亡时间”
+    if (hotspot_manager_->InterceptDelete(key, seq)) {
+      return Status::OK();
+    }
   }
 
   return DB::Delete(write_options, column_family, key);
@@ -107,8 +122,23 @@ Status DBImpl::Delete(const WriteOptions& write_options,
     return s;
   }
   // for delta
-  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
-    return Status::OK();
+  if (hotspot_manager_) {
+    // 1. 加锁，确保序列号分配的原子性
+    InstrumentedMutexLock l(&mutex_);
+
+    // 2. 获取当前时钟并 +1，模拟产生一个新的版本号
+    SequenceNumber seq = versions_->LastSequence() + 1;
+
+    // 3. 将系统的全局时钟推向未来
+    // 这一步至关重要：它保证了此后的 Get(当前读) 拿到的 sequence_ 至少是这个 seq
+    versions_->SetLastSequence(seq);
+    versions_->SetLastAllocatedSequence(seq);
+    versions_->SetLastPublishedSequence(seq);
+
+    // 4. 调用拦截器，记录这个“死亡时间”
+    if (hotspot_manager_->InterceptDelete(key, seq)) {
+      return Status::OK();
+    }
   }
 
   return DB::Delete(write_options, column_family, key, ts);

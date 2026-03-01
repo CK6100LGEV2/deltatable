@@ -2412,6 +2412,9 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 
   assert(get_impl_options.column_family);
 
+  // for delta
+  SequenceNumber found_seq = kMaxSequenceNumber; 
+
   if (read_options.timestamp) {
     const Status s = FailIfTsMismatchCf(get_impl_options.column_family,
                                         *(read_options.timestamp));
@@ -2550,7 +2553,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
               get_impl_options.value ? get_impl_options.value->GetSelf()
                                      : nullptr,
               get_impl_options.columns, timestamp, &s, &merge_context,
-              &max_covering_tombstone_seq, read_options,
+              &max_covering_tombstone_seq, &found_seq, read_options,
               false /* immutable_memtable */, get_impl_options.callback,
               get_impl_options.is_blob_index)) {
         done = true;
@@ -2566,7 +2569,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
                                   ? get_impl_options.value->GetSelf()
                                   : nullptr,
                               get_impl_options.columns, timestamp, &s,
-                              &merge_context, &max_covering_tombstone_seq,
+                              &merge_context, &max_covering_tombstone_seq, &found_seq, 
                               read_options, get_impl_options.callback,
                               get_impl_options.is_blob_index)) {
         done = true;
@@ -2582,7 +2585,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
       // merged and raw values should be returned to the user.
       if (sv->mem->Get(lkey, /*value=*/nullptr, /*columns=*/nullptr,
                        /*timestamp=*/nullptr, &s, &merge_context,
-                       &max_covering_tombstone_seq, read_options,
+                       &max_covering_tombstone_seq, &found_seq, read_options,
                        false /* immutable_memtable */, nullptr, nullptr,
                        false)) {
         done = true;
@@ -2611,7 +2614,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         timestamp, &s, &merge_context, &max_covering_tombstone_seq,
         &pinned_iters_mgr,
         get_impl_options.get_value ? get_impl_options.value_found : nullptr,
-        nullptr, nullptr,
+        nullptr, &found_seq,
         get_impl_options.get_value ? get_impl_options.callback : nullptr,
         get_impl_options.get_value ? get_impl_options.is_blob_index : nullptr,
         get_impl_options.get_value);
@@ -2714,12 +2717,17 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     // 如果读取成功，但该 CUID 在 GDCT 中被标记为删除，则强制返回 NotFound
     if (s.ok() && hotspot_manager_) {
         uint64_t cuid = hotspot_manager_->ExtractCUID(key);
-        if (cuid != 0 && hotspot_manager_->IsCuidDeleted(cuid)) {
-            // 如果需要的话，可以重置 value，防止内存泄露
-            if (get_impl_options.value) {
-                get_impl_options.value->Reset();
+        if (cuid != 0) {
+            SequenceNumber read_seq = read_options.snapshot ? 
+                                      static_cast<const SnapshotImpl*>(read_options.snapshot)->number_ : 
+                                      versions_->LastSequence();
+            
+            // 【核心修复】：使用刚才从物理层拿到的真实 found_seq 进行比对
+            // 如果物理数据的 seq (1002) > 删除 seq (1001)，判定结果为 False，数据得以保留！
+            if (hotspot_manager_->IsCuidDeleted(cuid, read_seq, found_seq)) {
+                 if (get_impl_options.value) get_impl_options.value->Reset();
+                 return Status::NotFound();
             }
-            return Status::NotFound();
         }
     }
   }

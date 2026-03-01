@@ -43,6 +43,7 @@ void GlobalDeleteCountTable::UntrackFiles(uint64_t cuid, const std::vector<uint6
   }
 }
 
+/*
 bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto it = table_.find(cuid);
@@ -61,6 +62,39 @@ bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid) const {
   }
   return false;
 }
+*/
+
+bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid, SequenceNumber seq) {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  auto& entry = table_[cuid];
+  entry.is_deleted = true;
+  // 只有当新的删除操作更新（Seq更大）时才更新
+  // 防止旧的删除请求覆盖新的状态
+  if (entry.deleted_seq == kMaxSequenceNumber || seq > entry.deleted_seq) {
+      entry.deleted_seq = seq;
+  }
+  return true;
+}
+
+bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid, SequenceNumber visible_seq, SequenceNumber found_seq) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it == table_.end() || !it->second.is_deleted) return false;
+
+  SequenceNumber del_seq = it->second.deleted_seq;
+  if (del_seq == kMaxSequenceNumber) return false;
+
+  // 1. 快照可见性：读操作的时间 (visible_seq) 必须晚于或等于删除时间
+  bool snapshot_sees_delete = (visible_seq >= del_seq);
+  
+  // 2. 数据陈旧性：[Delta Fix] 改为严格小于 (<)
+  // 如果 found_seq == del_seq，说明这是在删除发生的【同一逻辑时刻】或【之后】写入的新数据。
+  // (例如：删除用了 Seq 1001，紧接着真实的 Put 也分到了 Seq 1001)
+  // 这种情况下，数据是新的，不能被算作已删除！
+  bool data_is_older_than_delete = (found_seq < del_seq);
+
+  return snapshot_sees_delete && data_is_older_than_delete;
+}
 
 int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -69,6 +103,16 @@ int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {
     return it->second.GetRefCount();
   }
   return 0;
+}
+
+SequenceNumber GlobalDeleteCountTable::GetDeleteSequence(uint64_t cuid) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = table_.find(cuid);
+  if (it != table_.end() && it->second.is_deleted) {
+    return it->second.deleted_seq;
+  }
+  // 如果没找到或没标记删除，返回最大序列号表示“未删除”
+  return kMaxSequenceNumber;
 }
 
 bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {

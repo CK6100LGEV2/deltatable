@@ -2,6 +2,7 @@
 
 #include <string>
 #include <memory>
+#include "db/dbformat.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -41,14 +42,25 @@ class HotspotManager {
 
   void FinalizeScanAsCompaction(uint64_t cuid);
 
-  bool IsCuidDeleted(uint64_t cuid) {
+  /*bool IsCuidDeleted(uint64_t cuid) {
       return delete_table_.IsDeleted(cuid);
+  }*/
+
+  bool IsCuidDeleted(uint64_t cuid, 
+                     SequenceNumber visible_seq = kMaxSequenceNumber, 
+                     SequenceNumber found_seq = 0) {
+      return delete_table_.IsDeleted(cuid, visible_seq, found_seq);
+  }
+
+  SequenceNumber GetDeleteSequence(uint64_t cuid) const {
+      return delete_table_.GetDeleteSequence(cuid);
   }
 
   bool IsHot(uint64_t cuid);
 
   // 拦截 Delete 操作?
   bool InterceptDelete(const Slice& key);
+  bool InterceptDelete(const Slice& key, SequenceNumber seq);
 
   uint64_t ExtractCUID(const Slice& key);
 

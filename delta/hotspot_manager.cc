@@ -40,7 +40,7 @@ uint64_t HotspotManager::ExtractCUID(const Slice& key) {
   return cuid;
 }
 
-bool HotspotManager::InterceptDelete(const Slice& key) {
+/*bool HotspotManager::InterceptDelete(const Slice& key) {
   uint64_t cuid = ExtractCUID(key);
   if (cuid == 0) return false;
 
@@ -54,6 +54,12 @@ bool HotspotManager::InterceptDelete(const Slice& key) {
 
   // CUID 不在热点管理范围内
   return false;
+}*/
+
+bool HotspotManager::InterceptDelete(const Slice& key, SequenceNumber seq) {
+  uint64_t cuid = ExtractCUID(key);
+  if (cuid == 0) return false;
+  return delete_table_.MarkDeleted(cuid, seq); // 转发 Seq
 }
 
 std::string HotspotManager::GenerateSstFileName(uint64_t cuid) {

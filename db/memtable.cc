@@ -604,7 +604,8 @@ class MemTableIterator : public InternalIterator {
   // for delta physical
   uint64_t GetPhysicalId() override {
     // memtable pointer
-    return reinterpret_cast<uint64_t>(mem_); 
+    return 0;
+    // return reinterpret_cast<uint64_t>(mem_); 
   }
 
  private:

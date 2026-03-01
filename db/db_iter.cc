@@ -523,11 +523,10 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
             if (hotspot_manager_) {
               uint64_t cuid = hotspot_manager_->ExtractCUID(saved_key_.GetUserKey());
               if (cuid != 0) {
-                  // 如果 CUID 已被删除，跳过
-                  if (hotspot_manager_->IsCuidDeleted(cuid)) {
+                  // [Fix] 传入当前数据的 Sequence (ikey_.sequence) 进行比对！
+                  if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, sequence_, ikey_.sequence)) {
                     valid_ = false;
-                    ResetValueAndColumns(); // 这个函数用于清理 value_
-                    // RecordTick(statistics_, DELTA_LOGICAL_DELETE_SKIPPED);
+                    ResetValueAndColumns();
                     iter_.Next();
                     continue;
                   }
@@ -541,11 +540,12 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                   }
 
                   // 维护引用计数
-                if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
-                  hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
-                  delta_ctx_.visited_units_for_cuid.insert(phys_id);
-                  // // 记录该 Delta 片段在原始 LSM 中的位置？delta 列表
-                }
+                if (phys_id != 0 && 
+                      delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
+                      
+                      hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
+                      delta_ctx_.visited_units_for_cuid.insert(phys_id);
+                  }
      
               }
             }

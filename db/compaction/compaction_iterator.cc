@@ -462,36 +462,38 @@ bool CompactionIterator::InvokeFilterIfNeeded(bool* need_skip,
 void CompactionIterator::CheckHotspotFilters() {
   if (!hotspot_manager_) return;
 
-  // 1. 提取当前 Key 的 CUID
   uint64_t cuid = hotspot_manager_->ExtractCUID(input_.key());
-
-  // fprintf(stderr, "[DEBUG] Key size: %zu, Extracted CUID: %lu, IsDeleted: %d\n",
-  //        input_.key().size(), cuid, hotspot_manager_->GetDeleteTable().IsDeleted(cuid));
-
-  if (cuid == current_cuid_ && cuid != 0) {
-    return;
-  }
-
-  if (cuid != current_cuid_) {
-      skip_current_cuid_ = false;
-  }
-
-  current_cuid_ = cuid;
   if (cuid == 0) return;
 
+  // 1. 登记 Involved CUID (必须在所有 return 之前，确保对账正确)
   if (involved_cuids_) {
       involved_cuids_->insert(cuid);
   }
 
-  // c)	当读取到某个CUid的数据时，检查全局CUid删除计数表，若该CUid已被标记为删除，
-  // 则直接跳过该段数据，不写入新文件，并减去一次该CUid在计数表中的引用计数
-  // 
-  if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid)) {
-    skip_current_cuid_ = true;
-    // hotspot_manager_->GetDeleteTable().UntrackFiles(cuid, input_file_numbers_); // todo：防止 compaction 失败
-    return; 
+  // 2. 只有在 CUID 真正切换时，才重置 skip 标记
+  if (cuid != current_cuid_) {
+      current_cuid_ = cuid;
+      skip_current_cuid_ = false; // 重置为默认不跳过
   }
 
+  // 3. 【核心修正】：针对当前这个具体的版本进行检查
+  // 不能因为 cuid 没变就直接 return，因为 seq 不同可能导致删除判定不同
+  ParsedInternalKey ikey_check;
+  if (ParseInternalKey(input_.key(), &ikey_check, true).ok()) {
+      // 传入当前 key 的实际序列号 ikey_check.sequence
+      if (cuid == 200) {
+          fprintf(stderr, ">> MVCC_DEBUG: CUID 200 | KeySeq: %lu | DelSeq: %lu | IsDel: %d\n",
+                  ikey_check.sequence, 
+                  hotspot_manager_->GetDeleteSequence(cuid), // 假设您加了这个 Getter
+                  hotspot_manager_->GetDeleteTable().IsDeleted(cuid, kMaxSequenceNumber, ikey_check.sequence));
+      }
+      if (hotspot_manager_->GetDeleteTable().IsDeleted(cuid, kMaxSequenceNumber, ikey_check.sequence)) {
+          skip_current_cuid_ = true;
+      } else {
+          // 如果当前版本不符合删除条件（比如是重插的数据），必须把标记设回 false！
+          skip_current_cuid_ = false; 
+      }
+  }
 }
 
 void CompactionIterator::NextFromInput() {
@@ -1386,11 +1388,25 @@ void CompactionIterator::PrepareOutput() {
         zeroed_seqno = true;
       }
 
+      // [Delta Fix] 阻止 Delta 数据序列号清零，以保留 MVCC 判定能力
       if (zeroed_seqno) {
-        ikey_.sequence = 0;
-        last_key_seq_zeroed_ = true;
-        TEST_SYNC_POINT_CALLBACK("CompactionIterator::PrepareOutput:ZeroingSeq",
-                                 &ikey_);
+          bool is_delta_key = false;
+          if (hotspot_manager_) {
+              // ikey_.user_key 包含当前的 CUID
+              is_delta_key = (hotspot_manager_->ExtractCUID(ikey_.user_key) != 0);
+          }
+
+          // 只有当它不是 Delta 数据的 Key 时，才允许清零
+          if (!is_delta_key) {
+              ikey_.sequence = 0;
+              last_key_seq_zeroed_ = true;
+              TEST_SYNC_POINT_CALLBACK("CompactionIterator::PrepareOutput:ZeroingSeq",
+                                       &ikey_);
+          } else {
+              // 如果是 Delta Key，虽然 zeroed_seqno 为 true，我们也强制保留原 Seq
+              // 这样 GDCT 就能分清它是删除后重插的新数据 (found_seq > del_seq)
+              last_key_seq_zeroed_ = false; 
+          }
       }
     }
   }

@@ -1017,7 +1017,7 @@ Status FlushJob::WriteLevel0Table() {
           seqno_to_time_mapping_.get(), event_logger_, job_context_->job_id,
           &table_properties_, write_hint, full_history_ts_low, blob_callback_,
           base_, &memtable_payload_bytes, &memtable_garbage_bytes,
-          &flush_stats, &contained_cuids);
+          &flush_stats, &contained_cuids, db_options_.hotspot_manager);
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());

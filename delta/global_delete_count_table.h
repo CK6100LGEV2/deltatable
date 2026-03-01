@@ -10,12 +10,15 @@
 #include <vector>
 #include <unordered_set>
 #include "rocksdb/rocksdb_namespace.h"
+#include "rocksdb/types.h"
+#include "db/dbformat.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 struct GDCTEntry {
   std::unordered_set<uint64_t> tracked_phys_ids;
   bool is_deleted = false;
+  SequenceNumber deleted_seq = kMaxSequenceNumber; 
 
   int GetRefCount() const { return static_cast<int>(tracked_phys_ids.size()); }
 };
@@ -37,17 +40,21 @@ class GlobalDeleteCountTable {
 
   // 【Delete 阶段调用】
   // 直接在表中标记为 True，避免写 Tombstone
-  bool MarkDeleted(uint64_t cuid);
+  // bool MarkDeleted(uint64_t cuid);
+  bool MarkDeleted(uint64_t cuid, SequenceNumber seq);
 
   // 【Compaction/Read 阶段调用】
   // 检查是否已删除 (用于过滤数据)
-  bool IsDeleted(uint64_t cuid) const;
+  // bool IsDeleted(uint64_t cuid) const;
+  bool IsDeleted(uint64_t cuid, SequenceNumber visible_seq, SequenceNumber found_seq = 0) const;
 
   // 【Compaction 阶段调用】
   // 物理清理后减少引用计数
   void DecrementRefCount(uint64_t cuid);
 
   int GetRefCount(uint64_t cuid) const;
+  
+  SequenceNumber GetDeleteSequence(uint64_t cuid) const;
 
   // Compaction 原子更新：精确的 Input/Output 双向映射
   void AtomicCompactionUpdate(
