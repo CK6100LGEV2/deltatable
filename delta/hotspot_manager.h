@@ -77,6 +77,9 @@ class HotspotManager {
 
     // Flush 注册接口
   void RegisterFileRefs(uint64_t file_number, const std::unordered_set<uint64_t>& cuids);
+
+  // [新增] 封装 MemTable 的销账操作，用于 FlushJob
+  void UntrackMemTableRef(uint64_t cuid, uint64_t mem_id);
   
   // Compaction 闭环接口
   void ApplyCompactionResult(
@@ -126,6 +129,10 @@ class HotspotManager {
   std::unordered_map<uint64_t, uint64_t> l1_cuid_route_table_;
   // 记录 CUID 最后一次参与 Flush 的时间
   std::unordered_map<uint64_t, uint64_t> cuid_last_flush_time_;
+
+  // [新增] 内部辅助：清理时间戳记录
+  void GarbageCollectMetadata(const std::vector<uint64_t>& cuids);
+  void GarbageCollectMetadata(uint64_t cuid);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

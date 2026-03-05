@@ -86,14 +86,22 @@ void HotspotManager::RegisterFileRefs(uint64_t file_number, const std::unordered
     }
 }
 
+// 修改后的 Compaction 结果应用
 void HotspotManager::ApplyCompactionResult(
     const std::unordered_set<uint64_t>& involved_cuids,
     const std::vector<uint64_t>& input_files,
     const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids) {
-    
-    delete_table_.AtomicCompactionUpdate(involved_cuids, input_files, output_file_to_cuids);
 
-    // 新增：清理被合并/删除文件的元数据
+    // 1. 更新 GDCT 并获取被 GC 的 CUID 列表
+    std::vector<uint64_t> gc_cuids = delete_table_.AtomicCompactionUpdate(
+        involved_cuids, input_files, output_file_to_cuids);
+
+    // 2. 清理这些 CUID 的时间戳记录 (Fix Memory Leak)
+    if (!gc_cuids.empty()) {
+        GarbageCollectMetadata(gc_cuids);
+    }
+
+    // 3. 清理旧文件的元数据 (原有逻辑)
     std::lock_guard<std::mutex> lock(file_meta_mutex_);
     for (uint64_t fid : input_files) {
         file_to_cuids_.erase(fid);
@@ -199,5 +207,29 @@ double HotspotManager::GetFileGarbageRatio(uint64_t file_num) {
         if (delete_table_.IsDeleted(cuid)) deleted++;
     }
     return static_cast<double>(deleted) / it->second.size();
+}
+// 私有辅助：清理时间戳 Map
+// 注意：必须加 hint_mutex_，因为 CheckFragmentationAndHint 也在用这个 Map
+void HotspotManager::GarbageCollectMetadata(uint64_t cuid) {
+    std::lock_guard<std::mutex> lock(hint_mutex_);
+    cuid_last_flush_time_.erase(cuid);
+}
+
+void HotspotManager::GarbageCollectMetadata(const std::vector<uint64_t>& cuids) {
+    std::lock_guard<std::mutex> lock(hint_mutex_);
+    for (uint64_t cuid : cuids) {
+        cuid_last_flush_time_.erase(cuid);
+    }
+}
+
+// 封装的 MemTable 销账 (供 FlushJob 使用)
+void HotspotManager::UntrackMemTableRef(uint64_t cuid, uint64_t mem_id) {
+    // 1. 在 GDCT 中销账
+    bool erased = delete_table_.UntrackPhysicalUnit(cuid, mem_id);
+    
+    // 2. 如果 GDCT 条目被移除了，同步清理时间戳
+    if (erased) {
+        GarbageCollectMetadata(cuid);
+    }
 }
 }  // namespace ROCKSDB_NAMESPACE

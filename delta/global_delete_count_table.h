@@ -28,7 +28,7 @@ class GlobalDeleteCountTable {
   // 增加引用计数 (当 Scan 发现一个新的 SST/Memtable 包含该 CUID 时调用)
   bool TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
 
-  void UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
+  bool UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id);
 
   void UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids);
 
@@ -56,7 +56,7 @@ class GlobalDeleteCountTable {
   std::vector<uint64_t> GetTrackedFiles(uint64_t cuid) const;
 
   // Compaction 原子更新：精确的 Input/Output 双向映射
-  void AtomicCompactionUpdate(
+  std::vector<uint64_t> AtomicCompactionUpdate(
     const std::unordered_set<uint64_t>& involved_cuids,
     const std::vector<uint64_t>& input_files,
     const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids);

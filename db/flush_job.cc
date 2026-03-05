@@ -342,10 +342,8 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
               // 这一步确保了：即使 Flush 前被 Scan 过的 CUID，账目也能对平
               for (auto m : mems_) {
                 uint64_t actual_mem_id = reinterpret_cast<uint64_t>(m);
-                // 调试输出确认地址
-                fprintf(stderr, "[GDCT] Untracking Actual MemTable: %lu\n", actual_mem_id);
                 for (uint64_t cuid : committed_cuids_) {
-                    db_options_.hotspot_manager->GetDeleteTable().UntrackPhysicalUnit(cuid, actual_mem_id);
+                    db_options_.hotspot_manager->UntrackMemTableRef(cuid, actual_mem_id);
                 }
             }
             // [新增] 唤醒巡逻兵：传入当前系统时间
