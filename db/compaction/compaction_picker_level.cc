@@ -533,15 +533,38 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
   const int target_level = 1;
   const size_t total_files = l0_files.size();
 
-  if (total_files < static_cast<size_t>(mutable_cf_options_.level0_file_num_compaction_trigger)) {
-    return false;
-  }
-
   uint64_t current_time = ioptions_.env->NowMicros() / 1000000;
   auto hotspot_manager = ioptions_.hotspot_manager;
 
   // ===========================================================
-  // 1. [Sniper Mode] 狙击手模式：优先响应前台高频读取带来的合并暗示
+  // [新增特权 0] 高龄兜底下沉 (Age-Triggered Eviction)
+  // 针对“极慢写入”导致 L0 永远凑不够文件触发阈值的兜底策略
+  // 必须放在最前面，防止 L0 钉子户无限期霸占 EVS 空间
+  // ===========================================================
+  if (total_files > 0) {
+      uint64_t oldest_time = l0_files[total_files - 1]->file_creation_time;
+      // 如果最老文件在 L0 停留超过 6 小时 (21600 秒)
+      if (current_time > oldest_time && (current_time - oldest_time) > 21600) {
+          start_level_inputs_.level = 0;
+          start_level_inputs_.files.clear();
+          // 贪婪策略：既然要下沉了，就把现在 L0 没被锁定的文件全带下去
+          for (size_t i = 0; i < total_files; ++i) {
+               if (!l0_files[i]->being_compacted) {
+                   start_level_inputs_.files.push_back(l0_files[i]);
+               }
+          }
+          if (!start_level_inputs_.files.empty()) {
+              output_level_ = target_level;
+              compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+              ROCKS_LOG_INFO(ioptions_.logger, "[Delta] Age-Triggered L0->L1 Fallback Eviction.");
+              return true;
+          }
+      }
+  }
+
+  // ===========================================================
+  // 1.[Hint 响应调度] 处理 Delete 清理、L0 滚雪球、L1 归档
+  // 取代了原有的"盲目狙击手模式"，全面适应极慢写入与一次性删除
   // ===========================================================
   if (hotspot_manager && hotspot_manager->HasHighPriorityHints()) {
       CompactionHint hint = hotspot_manager->PopHint();
@@ -552,42 +575,61 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
       std::vector<FileMetaData*> l0_candidates;
       vstorage_->GetOverlappingInputs(0, &start_ikey, &end_ikey, &l0_candidates);
 
-      //[修复] 检查重叠是否失控
-      uint64_t total_sniper_size = 0;
+      uint64_t hint_total_size = 0;
       bool busy = false;
       for (auto* f : l0_candidates) {
           if (f->being_compacted) busy = true;
-          total_sniper_size += f->fd.GetFileSize();
+          hint_total_size += f->fd.GetFileSize();
       }
 
-      // 设定爆炸半径阈值 (如 256MB)
-      const uint64_t kMaxSniperSize = 256 * 1024 * 1024; 
-
       if (!busy && !l0_candidates.empty()) {
-        if (total_sniper_size > kMaxSniperSize) {
-          // 危险！重叠过于严重，放弃本次狙击
-            ROCKS_LOG_WARN(ioptions_.logger, 
-                "[Delta] Sniper aborted for CUID %lu due to massive overlap (%lu bytes)", 
-                hint.cuid, total_sniper_size);
-        }
-        ROCKS_LOG_INFO(ioptions_.logger, 
-            "[Delta-Smart] Sniper Targeted L0->L1 Compaction for CUID: %lu. Files: %zu", 
-            hint.cuid, l0_candidates.size());
-        
-        start_level_inputs_.level = 0;
-        start_level_inputs_.files = l0_candidates;
-        output_level_ = target_level;
-        compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
-        return true; 
+          start_level_inputs_.level = 0;
+          start_level_inputs_.files = l0_candidates;
+
+          if (hint.force_purge) {
+              // 由 Delete(Delta Merge 后) 触发的强制垃圾清理。
+              // 此时数据 100% 死亡。在 L0 就地执行合并（利用 O(1) Seek 极速跳跃）物理抹除。
+              output_level_ = 0; 
+              ROCKS_LOG_INFO(ioptions_.logger, 
+                  "[Delta-Smart] Force Purging dead CUID %lu in L0. Files: %zu", 
+                  hint.cuid, l0_candidates.size());
+          } 
+          else if (!hint.is_l0_to_l0 || hint_total_size >= 32 * 1024 * 1024) {
+              // 场景：CUID 已经脱离活跃写入期（冷却），或者体积已经养肥（>= 32MB）
+              // 动作：收割！推入 L1 (OBS) 归档，等待将来的 Delta Merge。
+              output_level_ = target_level;
+              ROCKS_LOG_INFO(ioptions_.logger, 
+                  "[Delta-Smart] Harvesting mature CUID %lu to L1 (Size: %lu MB).", 
+                  hint.cuid, hint_total_size / 1048576);
+          } 
+          else {
+              // 场景：CUID 还在涓流写入活跃期，且体积不足 32MB
+              // 动作：在 L0 内部滚雪球合并，控制物理碎片数（Ref Count），绝不碰 OBS 带宽！
+              output_level_ = 0;
+              ROCKS_LOG_INFO(ioptions_.logger, 
+                  "[Delta-Smart] Snowballing active CUID %lu within L0.", hint.cuid);
+          }
+
+          compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
+          return true; 
       }
   }
 
   // ===========================================================
+  // 常规阈值检查 (保护后面的全量扫描)
+  // 如果没有 Hint 特权任务且也没触发高龄兜底，必须满足文件数条件才继续
+  // ===========================================================
+  if (total_files < static_cast<size_t>(mutable_cf_options_.level0_file_num_compaction_trigger)) {
+    return false;
+  }
+
+  // ===========================================================
   // 2. [Garbage First] 极速清洗：利用本地/EVS IO清理大面积垃圾
+  // (保留原有优秀逻辑)
   // ===========================================================
   int dirtiest_idx = -1;
   double max_garbage_ratio = 0.0;
-  const double kDirtyThreshold = 0.30; // 30% 垃圾即触发强制清理
+  const double kDirtyThreshold = 0.30; 
   
   if (hotspot_manager) {
       for (size_t i = 0; i < total_files; ++i) {
@@ -615,7 +657,7 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
           if (!l0_files[i]->being_compacted) start_level_inputs_.files.push_back(l0_files[i]);
       }
       
-      if (start_level_inputs_.files.size() >= 1) { // 哪怕1个文件也自己洗自己
+      if (start_level_inputs_.files.size() >= 1) { 
           output_level_ = 0; 
           compaction_reason_ = CompactionReason::kLevelL0FilesNum;
           return true;
@@ -654,25 +696,38 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
       uint64_t win_l1_size = 0;
       for (const auto* l1_f : l1_overlaps) win_l1_size += l1_f->fd.GetFileSize();
 
-      // [Dirty Move Veto] 拦截带垃圾的 Trivial Move
+      //[Dirty Move Veto] 拦截带垃圾的 Trivial Move
       bool is_trivial_move = false;
       bool veto_move = false;
       if (win_l1_size == 0) {
           is_trivial_move = true;
           if (hotspot_manager) {
               double g = hotspot_manager->GetFileGarbageRatio(l0_files[start]->fd.GetNumber());
-              if (g > 0.10) veto_move = true; // 垃圾>10%，否决直接Move，迫使其执行Merge
+              if (g > 0.10) veto_move = true; 
           }
       }
 
       double score = 0.0;
       if (is_trivial_move && !veto_move) {
-          score = 1000000.0; // 纯净的 Trivial Move 极速通道
+          score = 1000000.0; 
       } else {
           double efficiency = static_cast<double>(win_l0_size) / (win_l0_size + win_l1_size + 1);
           uint64_t age = (current_time > oldest_time) ? (current_time - oldest_time) : 0;
           double age_factor = 1.0 + std::min(2.0, (double)age / 3600.0 * 0.2); 
-          score = efficiency * age_factor;
+          
+          //[新增：融合版本重合度，鼓励能引发坍缩的合并]
+          std::unordered_map<uint64_t, int> cuid_freq;
+          if (hotspot_manager) {
+              for (size_t k = start; k <= end; ++k) {
+                  auto cuids = hotspot_manager->GetCuidsInFile(l0_files[k]->fd.GetNumber());
+                  for (uint64_t cuid : cuids) cuid_freq[cuid]++;
+              }
+          }
+          int overlap_score = 0;
+          for (auto& pair : cuid_freq) if (pair.second > 1) overlap_score += pair.second;
+          double redundancy_factor = 1.0 + (overlap_score * 0.2); // 重叠越多分越高
+          
+          score = efficiency * age_factor * redundancy_factor;
       }
 
       if (score > best_window.score) {

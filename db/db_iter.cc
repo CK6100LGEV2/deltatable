@@ -551,11 +551,6 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key,
                 if (delta_ctx_.visited_units_for_cuid.find(phys_id) == delta_ctx_.visited_units_for_cuid.end()) {
                     hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, phys_id);
                     delta_ctx_.visited_units_for_cuid.insert(phys_id);
-                    
-                    // [新增]：如果发现这个 CUID 散落在超过 5 个物理单元里，说明读放大已经很严重了，发信号让 Picker 处理它
-                    if (hotspot_manager_->GetDeleteTable().GetRefCount(cuid) > 5) {
-                        hotspot_manager_->AddHint(cuid);
-                    }
                 }
               }
             }

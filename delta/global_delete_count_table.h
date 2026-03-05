@@ -52,6 +52,9 @@ class GlobalDeleteCountTable {
 
   int GetRefCount(uint64_t cuid) const;
 
+  // 获取该 CUID 目前分布在哪些文件里
+  std::vector<uint64_t> GetTrackedFiles(uint64_t cuid) const;
+
   // Compaction 原子更新：精确的 Input/Output 双向映射
   void AtomicCompactionUpdate(
     const std::unordered_set<uint64_t>& involved_cuids,
