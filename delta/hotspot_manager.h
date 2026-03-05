@@ -2,6 +2,7 @@
 
 #include <string>
 #include <memory>
+#include <queue>
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
@@ -14,6 +15,11 @@ struct ScanContext {
     uint64_t current_cuid = 0;
     // 当前 cuid 已访问的文件 ID (FileNumber...)
     std::unordered_set<uint64_t> visited_phys_units; 
+};
+struct CompactionHint {
+    uint64_t cuid;
+    std::string start_key;
+    std::string end_key;
 };
 
 class HotspotManager {
@@ -76,6 +82,22 @@ class HotspotManager {
     const std::vector<uint64_t>& input_files,
     const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids);
 
+  // Sniper 优化
+  bool HasHighPriorityHints();
+  void AddHint(uint64_t cuid);
+  CompactionHint PopHint();
+
+  // 垃圾密度优化
+  void RegisterFileMetadata(uint64_t file_num, const std::unordered_set<uint64_t>& cuids);
+  void UnregisterFileMetadata(uint64_t file_num);
+  double GetFileGarbageRatio(uint64_t file_num);
+
+  // L1 层路由 Guard
+  void UpdateL1Route(uint64_t cuid, uint64_t file_id);
+  void RemoveL1Route(uint64_t cuid);
+  bool IsCuidInL1(uint64_t cuid);
+  uint64_t GetL1FileId(uint64_t cuid);
+
  private:
   Options db_options_;
   std::string data_dir_;
@@ -85,6 +107,16 @@ class HotspotManager {
   std::mutex pending_mutex_;
   std::unordered_set<uint64_t> active_buffered_cuids_;
   std::mutex buffered_cuids_mutex_; // 保护上述集合
+  // 狙击手队列
+  std::queue<CompactionHint> priority_hints_;
+  std::mutex hint_mutex_;
+
+  std::mutex file_meta_mutex_;
+  std::unordered_map<uint64_t, std::vector<uint64_t>> file_to_cuids_;
+
+  std::shared_mutex l1_route_mutex_;
+  // 记录 CUID 所在的 L1 FileNumber
+  std::unordered_map<uint64_t, uint64_t> l1_cuid_route_table_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -10,6 +10,7 @@
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/env.h"
 #include "port/port.h"
+#include "db/dbformat.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -69,6 +70,8 @@ std::string HotspotManager::GenerateSstFileName(uint64_t cuid) {
 
 // [Delta Fix] 实现转发逻辑
 void HotspotManager::RegisterFileRefs(uint64_t file_number, const std::unordered_set<uint64_t>& cuids) {
+    std::lock_guard<std::mutex> lock(file_meta_mutex_);
+    file_to_cuids_[file_number] = std::vector<uint64_t>(cuids.begin(), cuids.end());
     for (uint64_t cuid : cuids) {
         delete_table_.TrackPhysicalUnit(cuid, file_number);
     }
@@ -80,5 +83,60 @@ void HotspotManager::ApplyCompactionResult(
     const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids) {
     
     delete_table_.AtomicCompactionUpdate(involved_cuids, input_files, output_file_to_cuids);
+
+    // 新增：清理被合并/删除文件的元数据
+    std::lock_guard<std::mutex> lock(file_meta_mutex_);
+    for (uint64_t fid : input_files) {
+        file_to_cuids_.erase(fid);
+    }
+}
+
+bool HotspotManager::HasHighPriorityHints() {
+    std::lock_guard<std::mutex> lock(hint_mutex_);
+    return !priority_hints_.empty();
+}
+
+void HotspotManager::AddHint(uint64_t cuid) {
+    std::lock_guard<std::mutex> lock(hint_mutex_);
+    if (priority_hints_.size() >= 100) return; // 防 OOM
+
+    // 精确构造 CUID 边界的 UserKey
+    std::string start_ukey(24, '\0');
+    std::string end_ukey(24, '\xFF');
+    for (int i = 0; i < 8; ++i) {
+        unsigned char c = (cuid >> (56 - 8 * i)) & 0xFF;
+        start_ukey[16 + i] = c;
+        end_ukey[16 + i] = c;
+    }
+
+    // 构造 InternalKey，覆盖该 CUID 的所有 SeqNum 和 Type
+    InternalKey start_ikey(start_ukey, kMaxSequenceNumber, kValueTypeForSeek);
+    InternalKey end_ikey(end_ukey, 0, kTypeDeletion);
+
+    priority_hints_.push({cuid, start_ikey.Encode().ToString(), end_ikey.Encode().ToString()});
+}
+
+CompactionHint HotspotManager::PopHint() {
+    std::lock_guard<std::mutex> lock(hint_mutex_);
+    CompactionHint h = priority_hints_.front();
+    priority_hints_.pop();
+    return h;
+}
+
+void HotspotManager::RegisterFileMetadata(uint64_t file_num, const std::unordered_set<uint64_t>& cuids) {
+    std::lock_guard<std::mutex> lock(file_meta_mutex_);
+    file_to_cuids_[file_num] = std::vector<uint64_t>(cuids.begin(), cuids.end());
+}
+
+double HotspotManager::GetFileGarbageRatio(uint64_t file_num) {
+    std::lock_guard<std::mutex> lock(file_meta_mutex_);
+    auto it = file_to_cuids_.find(file_num);
+    if (it == file_to_cuids_.end() || it->second.empty()) return 0.0;
+
+    int deleted = 0;
+    for (uint64_t cuid : it->second) {
+        if (delete_table_.IsDeleted(cuid)) deleted++;
+    }
+    return static_cast<double>(deleted) / it->second.size();
 }
 }  // namespace ROCKSDB_NAMESPACE

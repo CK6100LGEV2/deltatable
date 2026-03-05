@@ -17,6 +17,7 @@
 #include "logging/log_buffer.h"
 #include "logging/logging.h"
 #include "test_util/sync_point.h"
+#include "delta/hotspot_manager.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -526,185 +527,205 @@ struct WindowState {
   bool is_trivial_move = false;
 };
 
-// 辅助函数：估算文件的垃圾密度 (Report 5.4)
-// 使用 compensated_range_deletion_size 作为 Tombstone 密度的代理
-double GetGarbageDensity(const FileMetaData* f) {
-  if (f->fd.GetFileSize() == 0) return 0.0;
-  // RocksDB 会记录补偿后的删除大小，如果该值远大于物理大小，说明删除很密集
-  return static_cast<double>(f->compensated_range_deletion_size) / 
-         static_cast<double>(f->fd.GetFileSize());
-}
-
 bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
-  // 0. 环境准备
   const auto* icmp = vstorage_->InternalComparator();
   const auto& l0_files = vstorage_->LevelFiles(0);
   const int target_level = 1;
   const size_t total_files = l0_files.size();
 
-  // 触发条件检查
   if (total_files < static_cast<size_t>(mutable_cf_options_.level0_file_num_compaction_trigger)) {
     return false;
   }
 
   uint64_t current_time = ioptions_.env->NowMicros() / 1000000;
+  auto hotspot_manager = ioptions_.hotspot_manager;
+
+  // ===========================================================
+  // 1. [Sniper Mode] 狙击手模式：优先响应前台高频读取带来的合并暗示
+  // ===========================================================
+  if (hotspot_manager && hotspot_manager->HasHighPriorityHints()) {
+      CompactionHint hint = hotspot_manager->PopHint();
+      InternalKey start_ikey, end_ikey;
+      start_ikey.DecodeFrom(hint.start_key);
+      end_ikey.DecodeFrom(hint.end_key);
+      
+      std::vector<FileMetaData*> l0_candidates;
+      vstorage_->GetOverlappingInputs(0, &start_ikey, &end_ikey, &l0_candidates);
+
+      //[修复] 检查重叠是否失控
+      uint64_t total_sniper_size = 0;
+      bool busy = false;
+      for (auto* f : l0_candidates) {
+          if (f->being_compacted) busy = true;
+          total_sniper_size += f->fd.GetFileSize();
+      }
+
+      // 设定爆炸半径阈值 (如 256MB)
+      const uint64_t kMaxSniperSize = 256 * 1024 * 1024; 
+
+      if (!busy && !l0_candidates.empty()) {
+        if (total_sniper_size > kMaxSniperSize) {
+          // 危险！重叠过于严重，放弃本次狙击
+            ROCKS_LOG_WARN(ioptions_.logger, 
+                "[Delta] Sniper aborted for CUID %lu due to massive overlap (%lu bytes)", 
+                hint.cuid, total_sniper_size);
+        }
+        ROCKS_LOG_INFO(ioptions_.logger, 
+            "[Delta-Smart] Sniper Targeted L0->L1 Compaction for CUID: %lu. Files: %zu", 
+            hint.cuid, l0_candidates.size());
+        
+        start_level_inputs_.level = 0;
+        start_level_inputs_.files = l0_candidates;
+        output_level_ = target_level;
+        compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
+        return true; 
+      }
+  }
+
+  // ===========================================================
+  // 2. [Garbage First] 极速清洗：利用本地/EVS IO清理大面积垃圾
+  // ===========================================================
+  int dirtiest_idx = -1;
+  double max_garbage_ratio = 0.0;
+  const double kDirtyThreshold = 0.30; // 30% 垃圾即触发强制清理
   
-  // 配置参数 (可提升为 Options)
+  if (hotspot_manager) {
+      for (size_t i = 0; i < total_files; ++i) {
+          if (l0_files[i]->being_compacted) continue;
+          double ratio = hotspot_manager->GetFileGarbageRatio(l0_files[i]->fd.GetNumber());
+          if (ratio > max_garbage_ratio) {
+              max_garbage_ratio = ratio;
+              dirtiest_idx = static_cast<int>(i);
+          }
+      }
+  }
+
+  if (dirtiest_idx != -1 && max_garbage_ratio > kDirtyThreshold) {
+      ROCKS_LOG_INFO(ioptions_.logger, 
+          "[Delta-Smart] Dirty L0 File Detected (Garbage: %.2f%%). Triggering Intra-L0 Purge.", 
+          max_garbage_ratio * 100);
+
+      start_level_inputs_.level = 0;
+      start_level_inputs_.files.clear();
+      
+      int start_idx = std::max(0, dirtiest_idx - 1);
+      int end_idx = std::min(static_cast<int>(total_files) - 1, dirtiest_idx + 1);
+      
+      for (int i = start_idx; i <= end_idx; ++i) {
+          if (!l0_files[i]->being_compacted) start_level_inputs_.files.push_back(l0_files[i]);
+      }
+      
+      if (start_level_inputs_.files.size() >= 1) { // 哪怕1个文件也自己洗自己
+          output_level_ = 0; 
+          compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+          return true;
+      }
+  }
+
+  // ===========================================================
+  // 3.[Sliding Window] 常规滑动窗口 L0->L1
+  // ===========================================================
   const uint64_t kMaxWindowSize = mutable_cf_options_.max_compaction_bytes; 
-  const double kMinEfficiency = 0.1; // 熔断阈值: 写放大系数 > 10 (1/0.1) 则熔断
-  const int kMaxLookahead = 8;       // 滑动窗口最大向后看几个文件 (控制 CPU 开销)
-
+  const double kMinEfficiency = 0.1; 
+  int kMaxLookahead = (total_files > 0 && l0_files[0]->fd.GetFileSize() < 2 * 1024 * 1024) ? 12 : 6;
   WindowState best_window;
-
-  // -----------------------------------------------------------
-  // 1. 滑动窗口算法 (Report 5.1)
-  // -----------------------------------------------------------
+  
   for (size_t start = 0; start < total_files; ++start) {
     if (l0_files[start]->being_compacted) continue;
-
-    // 窗口状态初始化
     InternalKey win_smallest = l0_files[start]->smallest;
     InternalKey win_largest = l0_files[start]->largest;
     uint64_t win_l0_size = 0;
-    uint64_t oldest_creation_time = l0_files[start]->file_creation_time;
-    double max_garbage_density = GetGarbageDensity(l0_files[start]);
+    uint64_t oldest_time = l0_files[start]->file_creation_time;
 
-    // 向后扩展窗口
     for (size_t end = start; end < std::min(total_files, start + kMaxLookahead); ++end) {
       FileMetaData* f = l0_files[end];
-
-      // 窗口断裂检查
       if (f->being_compacted) break;
 
-      // 更新窗口边界 (Union Range)
       if (icmp->Compare(f->smallest, win_smallest) < 0) win_smallest = f->smallest;
       if (icmp->Compare(f->largest, win_largest) > 0) win_largest = f->largest;
-      
-      // 更新统计信息
       win_l0_size += f->fd.GetFileSize();
-      if (f->file_creation_time < oldest_creation_time) {
-          oldest_creation_time = f->file_creation_time;
-      }
-      max_garbage_density = std::max(max_garbage_density, GetGarbageDensity(f));
+      if (f->file_creation_time < oldest_time) oldest_time = f->file_creation_time;
 
-      // 窗口大小限制
       if (win_l0_size > kMaxWindowSize && end > start) break;
 
-      // -----------------------------------------------------------
-      // 2. 计算代价与收益 (Report 2.1 & 2.3)
-      // -----------------------------------------------------------
-      
-      // A. 获取 L1 重叠文件 (Cost)
       std::vector<FileMetaData*> l1_overlaps;
       vstorage_->GetOverlappingInputs(target_level, &win_smallest, &win_largest, &l1_overlaps);
       
       uint64_t win_l1_size = 0;
-      for (const auto* l1_f : l1_overlaps) {
-        win_l1_size += l1_f->fd.GetFileSize();
-      }
+      for (const auto* l1_f : l1_overlaps) win_l1_size += l1_f->fd.GetFileSize();
 
-      // B. Trivial Move 优先判定 (Report 2.2)
+      // [Dirty Move Veto] 拦截带垃圾的 Trivial Move
+      bool is_trivial_move = false;
+      bool veto_move = false;
       if (win_l1_size == 0) {
-        best_window.start_index = start;
-        best_window.end_index = end;
-        best_window.is_trivial_move = true;
-        best_window.score = 1000000.0; // Max Score
-        goto finalize_selection; // 找到最优解，直接跳出双层循环
+          is_trivial_move = true;
+          if (hotspot_manager) {
+              double g = hotspot_manager->GetFileGarbageRatio(l0_files[start]->fd.GetNumber());
+              if (g > 0.10) veto_move = true; // 垃圾>10%，否决直接Move，迫使其执行Merge
+          }
       }
 
-      // C. 效率因子 (Efficiency)
-      double total_io = static_cast<double>(win_l0_size + win_l1_size);
-      double efficiency = static_cast<double>(win_l0_size) / total_io;
+      double score = 0.0;
+      if (is_trivial_move && !veto_move) {
+          score = 1000000.0; // 纯净的 Trivial Move 极速通道
+      } else {
+          double efficiency = static_cast<double>(win_l0_size) / (win_l0_size + win_l1_size + 1);
+          uint64_t age = (current_time > oldest_time) ? (current_time - oldest_time) : 0;
+          double age_factor = 1.0 + std::min(2.0, (double)age / 3600.0 * 0.2); 
+          score = efficiency * age_factor;
+      }
 
-      // D. 时间权重 (Age Factor) - Report 2.3
-      uint64_t age_seconds = (current_time > oldest_creation_time) 
-                             ? (current_time - oldest_creation_time) : 0;
-      double age_hours = static_cast<double>(age_seconds) / 3600.0;
-      double age_factor = 1.0 + std::min(3.0, age_hours * 0.2); 
-
-      // E. 垃圾密度加权 (Report 5.4)
-      // 如果包含大量墓碑，大幅提升优先级
-      double garbage_factor = 1.0 + std::min(2.0, max_garbage_density * 2.0);
-
-      // F. 最终得分
-      double final_score = efficiency * age_factor * garbage_factor;
-
-      // 更新全局最佳
-      if (final_score > best_window.score) {
-        best_window.score = final_score;
+      if (score > best_window.score) {
+        best_window.score = score;
         best_window.start_index = static_cast<int>(start);
         best_window.end_index = static_cast<int>(end);
         best_window.l0_bytes = win_l0_size;
         best_window.l1_bytes = win_l1_size;
+        best_window.is_trivial_move = (is_trivial_move && !veto_move);
       }
+      if (is_trivial_move && !veto_move) continue;
     }
   }
 
-finalize_selection:
+  // ===========================================================
+  // 4. [Cost Control] 决策与熔断：保护 OBS 带宽
+  // ===========================================================
+  if (best_window.start_index == -1) return false;
 
-  // -----------------------------------------------------------
-  // 3. 决策与熔断 (Report 5.2)
-  // -----------------------------------------------------------
-  
-  if (best_window.start_index == -1) {
-    return false;
-  }
-
-  // 计算最佳窗口的效率
-  double best_efficiency = 0.0;
-  if (best_window.l0_bytes + best_window.l1_bytes > 0) {
-      best_efficiency = static_cast<double>(best_window.l0_bytes) / 
-                        static_cast<double>(best_window.l0_bytes + best_window.l1_bytes);
-  }
-
-  // 熔断检查：如果不是 Trivial Move 且效率低于阈值 (写放大过高)
-  if (!best_window.is_trivial_move && best_efficiency < kMinEfficiency) {
-      
-      // >>> 触发 L0-L0 (Intra-L0) 降级策略 <<<
+  double final_efficiency = static_cast<double>(best_window.l0_bytes) / (best_window.l0_bytes + best_window.l1_bytes + 1);
+  if (!best_window.is_trivial_move && final_efficiency < kMinEfficiency) {
       ROCKS_LOG_WARN(ioptions_.logger, 
-          "[Delta-Smart] Fuse Triggered! Efficiency %.4f < %.4f. Checking for L0-L0 opportunity.", 
-          best_efficiency, kMinEfficiency);
+          "[Delta-Smart] Efficiency Fuse Triggered (%.4f < %.4f). Fallback to L0-L0.", 
+          final_efficiency, kMinEfficiency);
 
-      // 寻找 L0 内部最老的一批文件进行合并，不涉及 L1
-      // 目标：通过 GDCT 清理物理空间，减少文件数
-      size_t intra_end = total_files - 1;
-      size_t intra_start = (total_files > 5) ? total_files - 5 : 0; // 选最后5个
+      int intra_end = static_cast<int>(total_files) - 1;
+      int intra_start = std::max(0, intra_end - 4); 
       
       start_level_inputs_.level = 0;
       start_level_inputs_.files.clear();
-      for (size_t i = intra_start; i <= intra_end; ++i) {
-          if (!l0_files[i]->being_compacted) {
-              start_level_inputs_.files.push_back(l0_files[i]);
-          }
+      for (int i = intra_start; i <= intra_end; ++i) {
+          if (!l0_files[i]->being_compacted) start_level_inputs_.files.push_back(l0_files[i]);
       }
+      if (start_level_inputs_.files.size() < 2) return false;
 
-      if (start_level_inputs_.files.size() < 2) {
-          return false; // 无法构建有效的 L0-L0
-      }
-
-      output_level_ = 0; // 强制 L0 -> L0
+      output_level_ = 0; 
       compaction_reason_ = CompactionReason::kLevelL0FilesNum;
-      ROCKS_LOG_BUFFER(log_buffer_, "[Delta-Smart] Fallback to Intra-L0 Compaction. Files: %zu", 
-                       start_level_inputs_.files.size());
       return true;
   }
 
-  // -----------------------------------------------------------
-  // 4. 构造 L0->L1 Compaction
-  // -----------------------------------------------------------
+  // 组装常规 L0->L1 输出
   start_level_inputs_.level = 0;
   start_level_inputs_.files.clear();
   for (int i = best_window.start_index; i <= best_window.end_index; ++i) {
     start_level_inputs_.files.push_back(l0_files[i]);
   }
   output_level_ = target_level;
-  
   compaction_reason_ = CompactionReason::kLevelL0FilesNum;
 
   ROCKS_LOG_BUFFER(log_buffer_, 
-      "[Delta-Smart] Picked L0->L1. Files: %d-%d, Score: %.2f, Type: %s", 
+      "[Delta-Smart] Picked L0->L1. Files: %d-%d, Score: %.2f, Mode: %s", 
       best_window.start_index, best_window.end_index, best_window.score,
-      best_window.is_trivial_move ? "Trivial" : "Merge");
+      best_window.is_trivial_move ? "Trivial Move" : (best_window.l1_bytes == 0 ? "Purifying Move" : "Merge"));
 
   return true;
 }

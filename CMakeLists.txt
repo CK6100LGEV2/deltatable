@@ -775,6 +775,7 @@ set(SOURCES
         db_stress_tool/db_stress_compression_manager.cc
         delta/hotspot_manager.cc
         delta/global_delete_count_table.cc
+        delta/cuid_partitioner.cc 
         env/composite_env.cc
         env/env.cc
         env/env_chroot.cc
