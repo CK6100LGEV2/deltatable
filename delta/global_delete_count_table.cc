@@ -79,14 +79,6 @@ bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
   return table_.find(cuid) != table_.end();
 }
 
-void GlobalDeleteCountTable::ClearDeletedFlag(uint64_t cuid) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    auto it = table_.find(cuid);
-    if (it != table_.end()) {
-        it->second.is_deleted = false; // 撤销删除标记，给予新生
-    }
-}
-
 // 获取该 CUID 目前分布在哪些文件里
 std::vector<uint64_t> GlobalDeleteCountTable::GetTrackedFiles(uint64_t cuid) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);

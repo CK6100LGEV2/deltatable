@@ -28,12 +28,6 @@ Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
   if (!s.ok()) {
     return s;
   }
-  if (hotspot_manager_) {
-    uint64_t cuid = hotspot_manager_->ExtractCUID(key);
-    if (cuid != 0) {
-        hotspot_manager_->GetDeleteTable().ClearDeletedFlag(cuid);
-    }
-  }
   return DB::Put(o, column_family, key, val);
 }
 
@@ -42,12 +36,6 @@ Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
   const Status s = FailIfTsMismatchCf(column_family, ts);
   if (!s.ok()) {
     return s;
-  }
-  if (hotspot_manager_) {
-    uint64_t cuid = hotspot_manager_->ExtractCUID(key);
-    if (cuid != 0) {
-        hotspot_manager_->GetDeleteTable().ClearDeletedFlag(cuid);
-    }
   }
   return DB::Put(o, column_family, key, ts, val);
 }

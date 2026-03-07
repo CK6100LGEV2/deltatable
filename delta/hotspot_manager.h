@@ -86,26 +86,6 @@ class HotspotManager {
     const std::unordered_set<uint64_t>& involved_cuids,
     const std::vector<uint64_t>& input_files,
     const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids);
-  
-  std::vector<uint64_t> GetCuidsInFile(uint64_t file_num);
-
-  // Sniper 优化
-  bool HasHighPriorityHints();
-  void AddHint(uint64_t cuid, bool force_purge = false);
-  // 检查一批 CUID 是否碎片化
-  void CheckFragmentationAndHint(const std::unordered_set<uint64_t>& cuids, uint64_t current_time);
-  CompactionHint PopHint();
-
-  // 垃圾密度优化
-  void RegisterFileMetadata(uint64_t file_num, const std::unordered_set<uint64_t>& cuids);
-  void UnregisterFileMetadata(uint64_t file_num);
-  double GetFileGarbageRatio(uint64_t file_num);
-
-  // L1 层路由 Guard
-  void UpdateL1Route(uint64_t cuid, uint64_t file_id);
-  void RemoveL1Route(uint64_t cuid);
-  bool IsCuidInL1(uint64_t cuid);
-  uint64_t GetL1FileId(uint64_t cuid);
 
  private:
   Options db_options_;
@@ -116,23 +96,6 @@ class HotspotManager {
   std::mutex pending_mutex_;
   std::unordered_set<uint64_t> active_buffered_cuids_;
   std::mutex buffered_cuids_mutex_; // 保护上述集合
-  // 队列Hint优化
-  std::queue<CompactionHint> priority_hints_;
-  std::unordered_set<uint64_t> queued_cuids_; // 用于 Hint 去重
-  std::mutex hint_mutex_;
-
-  std::mutex file_meta_mutex_;
-  std::unordered_map<uint64_t, std::vector<uint64_t>> file_to_cuids_;
-
-  std::shared_mutex l1_route_mutex_;
-  // 记录 CUID 所在的 L1 FileNumber
-  std::unordered_map<uint64_t, uint64_t> l1_cuid_route_table_;
-  // 记录 CUID 最后一次参与 Flush 的时间
-  std::unordered_map<uint64_t, uint64_t> cuid_last_flush_time_;
-
-  // [新增] 内部辅助：清理时间戳记录
-  void GarbageCollectMetadata(const std::vector<uint64_t>& cuids);
-  void GarbageCollectMetadata(uint64_t cuid);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

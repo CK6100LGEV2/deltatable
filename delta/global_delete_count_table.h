@@ -47,9 +47,6 @@ class GlobalDeleteCountTable {
   // 物理清理后减少引用计数
   void DecrementRefCount(uint64_t cuid);
 
-  // 重生时清理逻辑删除标记
-  void ClearDeletedFlag(uint64_t cuid);
-
   int GetRefCount(uint64_t cuid) const;
 
   // 获取该 CUID 目前分布在哪些文件里

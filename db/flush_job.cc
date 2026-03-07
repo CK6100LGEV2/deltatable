@@ -346,9 +346,6 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
                     db_options_.hotspot_manager->UntrackMemTableRef(cuid, actual_mem_id);
                 }
             }
-            // [新增] 唤醒巡逻兵：传入当前系统时间
-            uint64_t now_sec = db_options_.env->NowMicros() / 1000000;
-            db_options_.hotspot_manager->CheckFragmentationAndHint(committed_cuids_, now_sec);
           }
       }
     }
