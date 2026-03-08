@@ -335,9 +335,10 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
       // [Delta Fix]
       if (s.ok() && db_options_.hotspot_manager) {
           uint64_t new_file_number = meta_.fd.GetNumber();
+          uint64_t new_file_size = meta_.fd.GetFileSize(); 
           
           if (!committed_cuids_.empty()) {
-              db_options_.hotspot_manager->RegisterFileRefs(new_file_number, committed_cuids_);
+              db_options_.hotspot_manager->RegisterFileRefs(new_file_number, new_file_size, committed_cuids_);
               // 移除旧 MemTable 的账单 (-1)
               // 这一步确保了：即使 Flush 前被 Scan 过的 CUID，账目也能对平
               for (auto m : mems_) {
@@ -346,6 +347,9 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
                     db_options_.hotspot_manager->UntrackMemTableRef(cuid, actual_mem_id);
                 }
             }
+            // L0 加入索引
+            std::vector<uint64_t> cuid_vec(committed_cuids_.begin(), committed_cuids_.end());
+            db_options_.hotspot_manager->AddL0Tracking(new_file_number, cuid_vec);
           }
       }
     }

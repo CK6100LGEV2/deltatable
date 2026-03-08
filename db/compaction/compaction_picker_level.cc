@@ -540,22 +540,50 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
   const auto& l0_files = vstorage_->LevelFiles(0);
   const size_t total_files = l0_files.size();
   const int target_level = 1;
+  auto hotspot_manager = ioptions_.hotspot_manager;
 
-  // 1. 基础触发检查
-  if (total_files < static_cast<size_t>(mutable_cf_options_.level0_file_num_compaction_trigger)) {
-    return false;
+  if (total_files == 0) return false;
+
+  // ===========================================================
+  // 1. [优化 6] 100% 纯垃圾文件的“零成本超度” (Ghost File Drop)
+  // 利用 L0 双向全索引，在 L0 层就地物理抹除，免去任何下沉代价
+  // ===========================================================
+  if (hotspot_manager) {
+      for (size_t i = 0; i < total_files; ++i) {
+          if (l0_files[i]->being_compacted) continue;
+          
+          double garbage_ratio = hotspot_manager->GetL0FileGarbageRatio(l0_files[i]->fd.GetNumber());
+          // 容差设计：如果超过 99% 是死数据，直接作为独立的 L0->L0 任务丢弃
+          if (garbage_ratio > 0.99) {
+              start_level_inputs_.level = 0;
+              start_level_inputs_.files.push_back(l0_files[i]);
+              output_level_ = 0; // 内部清理
+              compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
+              ROCKS_LOG_INFO(ioptions_.logger, "[Delta] Zero-Cost Drop for Ghost L0 File %lu", l0_files[i]->fd.GetNumber());
+              return true;
+          }
+      }
   }
 
-  uint64_t current_time = ioptions_.env->NowMicros() / 1000000;
-  WindowState best_window;
-  const uint64_t kMaxCompactionBytes = mutable_cf_options_.max_compaction_bytes;
+  // ===========================================================
+  // 2. 基础触发检查 (守住性能底线)
+  // ===========================================================
+  if (total_files < static_cast<size_t>(mutable_cf_options_.level0_file_num_compaction_trigger)) {
+      return false;
+  }
 
   // ===========================================================
-  // 2. 贪婪滑动窗口评估 (基于标准元数据)
+  // 3.[优化 8 & 5 & 7] 贪婪滑动窗口：寻找“最小阻力”的 L0->L1 下沉路径
+  // 融合了你原版的宽窗口批量合并策略
   // ===========================================================
+  WindowState best_sink_window;
+  WindowState best_align_window;
+  
+  const uint64_t kMaxCompactionBytes = mutable_cf_options_.max_compaction_bytes;
+  const double kMaxSinkWA = 5.0; // 核心阈值：写放大超过 5 倍，绝不下沉！
+
   for (size_t start = 0; start < total_files; ++start) {
     if (l0_files[start]->being_compacted) continue;
-    
     InternalKey win_smallest = l0_files[start]->smallest;
     InternalKey win_largest = l0_files[start]->largest;
     uint64_t win_l0_size = 0;
@@ -564,59 +592,115 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
       FileMetaData* f = l0_files[end];
       if (f->being_compacted) break;
 
-      // 维护窗口边界
+      // 更新窗口边界
       if (icmp->Compare(f->smallest, win_smallest) < 0) win_smallest = f->smallest;
       if (icmp->Compare(f->largest, win_largest) > 0) win_largest = f->largest;
       win_l0_size += f->fd.GetFileSize();
 
-      // 窗口过载保护
+      // 窗口过载保护 (限制为最大允许值的一半，避免 OOM)
       if (win_l0_size > (kMaxCompactionBytes / 2) && end > start) break;
 
-      // 查询 L1 的重叠大小（通过 RocksDB 标准 API）
+      // -------------------------------------------------------
+      // [优化 7] 严格的 CUID 闭包约束 (Closure Constraint)
+      // 防止“半个 CUID”下沉导致 L1 频繁重写
+      // -------------------------------------------------------
+      bool is_closure = true;
+      if (hotspot_manager) {
+          uint64_t head_cuid = hotspot_manager->ExtractCUID(win_smallest.user_key());
+          uint64_t tail_cuid = hotspot_manager->ExtractCUID(win_largest.user_key());
+          
+          auto check_cuid_closure = [&](uint64_t cuid_to_check) {
+              if (cuid_to_check == 0) return true;
+              auto fids = hotspot_manager->GetL0FilesForCuid(cuid_to_check);
+              // 如果这个 CUID 包含在某个不在当前窗口 [start, end] 范围内的 L0 文件中，则闭包破裂
+              for (uint64_t fid : fids) {
+                  bool found = false;
+                  for (size_t i = start; i <= end; ++i) {
+                      if (l0_files[i]->fd.GetNumber() == fid) { found = true; break; }
+                  }
+                  if (!found) return false;
+              }
+              return true;
+          };
+          
+          if (!check_cuid_closure(head_cuid) || !check_cuid_closure(tail_cuid)) {
+              is_closure = false; 
+          }
+      }
+
+      // 如果未形成闭包，拒绝下沉，但继续扩大窗口尝试包容所有碎片
+      if (!is_closure) continue; 
+
+      // -------------------------------------------------------
+      // 核心打分：计算 L1 最小阻力 (WA)
+      // -------------------------------------------------------
       std::vector<FileMetaData*> l1_overlaps;
       vstorage_->GetOverlappingInputs(target_level, &win_smallest, &win_largest, &l1_overlaps);
       uint64_t win_l1_size = 0;
       for (const auto* l1_f : l1_overlaps) win_l1_size += l1_f->fd.GetFileSize();
-
-      // 计算写放大相关的打分
-      double score = 0.0;
+      
+      double wa = static_cast<double>(win_l0_size + win_l1_size) / win_l0_size;
       bool is_trivial_move = (win_l1_size == 0);
 
-      if (is_trivial_move) {
-          score = 1000000.0; // 零成本移动优先级最高
-      } else {
-          // 效率因子 = L0 / (L0 + L1 + 1)
-          double efficiency = static_cast<double>(win_l0_size) / (win_l0_size + win_l1_size + 1);
-          // 批量奖励：鼓励一次合并更多 L0 文件
-          double batch_bonus = 1.0 + (static_cast<double>(end - start) * 0.1);
-          score = efficiency * batch_bonus;
+      // 评估 A: L0->L1 下沉 (必须满足低 WA)
+      if (wa <= kMaxSinkWA || is_trivial_move) {
+          double sink_score = 0.0;
+          if (is_trivial_move) {
+              sink_score = 1000000.0; // 零成本 Move 永远最优
+          } else {
+              // 继承你原版的优秀逻辑：奖励宽扇出批量合并
+              double efficiency = static_cast<double>(win_l0_size) / (win_l0_size + win_l1_size + 1);
+              double batch_bonus = 1.0 + (static_cast<double>(end - start) * 0.1);
+              sink_score = efficiency * batch_bonus;
+          }
+
+          if (sink_score > best_sink_window.score) {
+              best_sink_window.Update(start, end, win_l0_size, win_l1_size, sink_score, is_trivial_move);
+          }
       }
 
-      if (score > best_window.score) {
-        best_window.Update(start, end, win_l0_size, win_l1_size, score, is_trivial_move);
+      // 评估 B: 对齐式 Intra-L0 的备选分数 (越宽越好)
+      // 如果下沉代价太高，我们总能在 L0 内部找到最宽的窗口进行对齐整理
+      double align_score = static_cast<double>(end - start + 1); 
+      if (align_score > best_align_window.score) {
+          best_align_window.Update(start, end, win_l0_size, 0, align_score, false);
       }
     }
   }
 
-  if (best_window.start_index == -1) return false;
-
   // ===========================================================
-  // 3. 策略决策：下沉 L1 还是 原地揉面 (Intra-L0)
+  // 4. 最终博弈决策 (The Execution)
   // ===========================================================
   
-  double wa_ratio = (best_window.l0_bytes > 0) ? 
-      (static_cast<double>(best_window.l0_bytes + best_window.l1_bytes) / best_window.l0_bytes) : 100.0;
-
-  // 熔断：如果写放大 > 15 倍，则放弃下沉 L1，改为 Intra-L0 整理
-  if (!best_window.is_trivial_move && wa_ratio > 15.0) {
-      ROCKS_LOG_WARN(ioptions_.logger, 
-          "[Simple-Picker] WA too high (%.1fx). Executing simple Intra-L0 fallback.", wa_ratio);
-
+  // 决策 A：成功找到一条代价极小的下沉路径 (WA < 5.0)
+  if (best_sink_window.start_index != -1) {
       start_level_inputs_.level = 0;
-      start_level_inputs_.files.clear();
-      // 选取 L0 中最早生成的 4 个文件合并，减少文件数以保命
+      for (int i = best_sink_window.start_index; i <= best_sink_window.end_index; ++i) {
+          start_level_inputs_.files.push_back(l0_files[i]);
+      }
+      output_level_ = target_level;
+      compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+      
+      double final_wa = (best_sink_window.l0_bytes > 0) ? 
+          (static_cast<double>(best_sink_window.l0_bytes + best_sink_window.l1_bytes) / best_sink_window.l0_bytes) : 1.0;
+      
+      ROCKS_LOG_BUFFER(log_buffer_, 
+          "[Delta-Smart] Least-Resistance L0->L1. Files: %d-%d, WA: %.1fx, Mode: %s", 
+          best_sink_window.start_index, best_sink_window.end_index, final_wa,
+          best_sink_window.is_trivial_move ? "Move" : "Merge");
+          
+      return true;
+  }
+
+  // 决策 B：[优化 3] 被动对齐式 Intra-L0 降级 (L1 封锁，强制熔断)
+  // 如果所有窗口的 WA 都大于 5.0，说明 L1 层在该区域太厚了。
+  // 我们利用 CuidPartitioner 在 L0 原地把碎片切成规整的“牙签”，为未来的低代价下沉做铺垫。
+  if (best_align_window.start_index != -1) {
+      start_level_inputs_.level = 0;
+      
+      // 为了防止单次耗时过长，我们只取 L0 最早生成的几个文件进行降级合并
       int intra_end = static_cast<int>(total_files) - 1;
-      int intra_start = std::max(0, intra_end - 3); 
+      int intra_start = std::max(0, intra_end - 4); 
       for (int i = intra_start; i <= intra_end; ++i) {
           if (!l0_files[i]->being_compacted) start_level_inputs_.files.push_back(l0_files[i]);
       }
@@ -624,26 +708,13 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
       if (start_level_inputs_.files.size() >= 2) {
           output_level_ = 0; 
           compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+          ROCKS_LOG_WARN(ioptions_.logger, 
+              "[Delta-Smart] L1 Blockaded (WA > 5.0). Executing Passive Aligned Intra-L0.");
           return true;
       }
-      return false;
   }
 
-  // 正常的 L0 -> L1 任务
-  start_level_inputs_.level = 0;
-  start_level_inputs_.files.clear();
-  for (int i = best_window.start_index; i <= best_window.end_index; ++i) {
-    start_level_inputs_.files.push_back(l0_files[i]);
-  }
-  output_level_ = target_level;
-  compaction_reason_ = CompactionReason::kLevelL0FilesNum;
-
-  ROCKS_LOG_BUFFER(log_buffer_, 
-      "[Simple-Picker] Picked L0->L1. Files: %d-%d, Score: %.2f, Mode: %s", 
-      best_window.start_index, best_window.end_index, best_window.score,
-      best_window.is_trivial_move ? "Move" : "Merge");
-
-  return true;
+  return false;
 }
 
 Compaction* LevelCompactionBuilder::PickCompaction() {

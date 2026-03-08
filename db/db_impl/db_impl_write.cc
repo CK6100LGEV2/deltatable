@@ -92,7 +92,7 @@ Status DBImpl::Delete(const WriteOptions& write_options,
     return s;
   }
   // for delta
-  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
+  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key, this)) {
     return Status::OK();
   }
 
@@ -107,7 +107,7 @@ Status DBImpl::Delete(const WriteOptions& write_options,
     return s;
   }
   // for delta
-  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key)) {
+  if (hotspot_manager_ && hotspot_manager_->InterceptDelete(key, this)) {
     return Status::OK();
   }
 

@@ -8,19 +8,14 @@ class CuidPrefixExtractor : public SliceTransform {
 public:
   const char* Name() const override { return "CuidPrefixExtractor"; }
 
-  // 提取前 24 字节 (16 Pad + 8 CUID) 作为前缀
   Slice Transform(const Slice& key) const override {
-    if (key.size() < 24) return key; 
+    // 16 字节 pad + 8 字节 CUID = 24 字节
+    if (key.size() < 24) return key;
     return Slice(key.data(), 24);
   }
 
-  bool InDomain(const Slice& key) const override {
-    return key.size() >= 24;
-  }
-
-  bool InRange(const Slice& dst) const override {
-    return dst.size() == 24;
-  }
+  bool InDomain(const Slice& key) const override { return key.size() >= 24; }
+  bool InRange(const Slice& dst) const override { return dst.size() == 24; }
 };
 
 }

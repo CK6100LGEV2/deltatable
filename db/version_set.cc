@@ -6383,6 +6383,57 @@ Status VersionSet::LogAndApply(
     // should only SetBGError once.
     return first_writer.status;
   }
+
+  // [Delta Fix] 定义统一的 L0 索引清理 Lambda
+  auto cleanup_l0_index_if_needed = [&](const Status& status) {
+    if (status.ok()) {
+      // 遍历所有涉及的列族
+      for (size_t i = 0; i < column_family_datas.size(); ++i) {
+        auto cfd = column_family_datas[i];
+        // 只有非列族操作（如 Add/Drop CF）且配置了 hotspot_manager 的才处理
+        if (cfd == nullptr) continue;
+        
+        auto hm = cfd->ioptions().hotspot_manager;
+        if (!hm) continue;
+
+        // 处理该列族对应的所有 VersionEdit
+        for (auto* edit : edit_lists[i]) {
+          // 1. 收集当前 Edit 中所有新出现在 Level 0 的文件 ID
+          // 在 L0 内部移动（如 Sub-level 变更）时，文件 ID 会同时出现在 NewFiles 和 DeletedFiles 中
+          std::unordered_set<uint64_t> added_to_l0;
+          for (const auto& new_file : edit->GetNewFiles()) {
+            if (new_file.first == 0) { // 新文件在 Level 0
+              added_to_l0.insert(new_file.second.fd.GetNumber());
+            }
+          }
+
+          // 2. 遍历删除列表：只有不在新增列表里的 L0 文件，才是真正的“离开 L0”
+          for (const auto& deleted_file : edit->GetDeletedFiles()) {
+            if (deleted_file.first == 0) { // 移出 Level 0
+              uint64_t fid = deleted_file.second;
+              
+              // 增强型判断：如果该文件 ID 没有出现在 Level 0 的新增列表里
+              // 说明它是真的被删除了，或者是去了 Level 1+
+              if (added_to_l0.find(fid) == added_to_l0.end()) {
+                fprintf(stderr, "[L0-INDEX-LOG] Triggering Remove for fid: %lu (Truly left L0)\n", fid);
+                hm->RemoveL0Tracking(fid);
+              } else {
+                fprintf(stderr, "[L0-INDEX-LOG] Preserving Index for fid: %lu (Intra-L0 Move detected)\n", fid);
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  if (first_writer.done) {
+    // 追随者路径：由其他线程（Leader）代为完成了写入
+    Status s = first_writer.status;
+    cleanup_l0_index_if_needed(s); // 执行核销
+    return s;
+  }
+
   TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:WakeUpAndNotDone", mu);
 
   int num_undropped_cfds = 0;
@@ -6412,9 +6463,12 @@ Status VersionSet::LogAndApply(
     }
     return s;
   } else {
-    return ProcessManifestWrites(writers, mu, dir_contains_current_file,
-                                 new_descriptor_log, new_cf_options,
-                                 read_options, write_options);
+    // 领导者路径：亲自执行批量写入
+    s = ProcessManifestWrites(writers, mu, dir_contains_current_file,
+                              new_descriptor_log, new_cf_options,
+                              read_options, write_options);
+    cleanup_l0_index_if_needed(s); // 执行核销
+    return s;
   }
 }
 

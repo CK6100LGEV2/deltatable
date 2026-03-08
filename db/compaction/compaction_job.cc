@@ -2303,41 +2303,45 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
        std::cout << "[GDCT-DEBUG] Compaction Plan: Destroying " << input_file_numbers_.size() << " files: ";
       for (auto id : input_file_numbers_) std::cout << id << " ";
       std::cout << std::endl;
-      
-      /*if (!new_files.empty()) {
-          for (const auto& file_meta : new_files) {
-              // 这里的变量只在循环内部定义，避免 Shadow 报错
-              uint64_t output_id = file_meta.second.fd.GetNumber();
-              std::unordered_set<uint64_t> survivor_cuids;
 
-              // 从之前保存的 map 中查找幸存的 CUID
-              auto it = output_cuids_.find(output_id);
-              if (it != output_cuids_.end()) {
-                  survivor_cuids = it->second;
-              }
-
-              // 执行原子更新
-              hotspot_manager_->ApplyCompactionResult(
-                  compaction_involved_cuids_, 
-                  input_file_numbers_,        
-                  output_id,                  
-                  survivor_cuids              
-              );
-          }
-      } else {
-          // 如果没有任何新文件生成（例如全被 GC 丢弃了），也要清理旧引用
-          hotspot_manager_->ApplyCompactionResult(
-              compaction_involved_cuids_, 
-              input_file_numbers_,        
-              0,                  
-              {}              
-          );
-      }*/
       hotspot_manager_->ApplyCompactionResult(
           compaction_involved_cuids_, 
           input_file_numbers_,
           output_cuids_
       );
+
+      auto* c = compact_->compaction;
+      // 如果生成了新的 L0 文件 (Intra-L0)，注册到 L0 索引
+      // (注：L0 索引的 Add 必须在这里做，因为 VersionEdit 里没有 CUID 信息)
+      for (const auto& new_file : new_files) {
+          int level = new_file.first;
+          uint64_t fid = new_file.second.fd.GetNumber();
+          fprintf(stderr, "[L0-INDEX-JOB] Checking New File: %lu at Level: %d\n", fid, level);
+          
+          if (level == 0) {
+              auto it = output_cuids_.find(fid);
+              if (it != output_cuids_.end()) {
+                  fprintf(stderr, "[L0-INDEX-JOB] MATCH! Registering fid: %lu to L0 Index\n", fid);
+                  std::vector<uint64_t> cuid_vec(it->second.begin(), it->second.end());
+                  hotspot_manager_->AddL0Tracking(fid, cuid_vec);
+              } else {
+                  fprintf(stderr, "[L0-INDEX-JOB] MISMATCH! fid %lu not found in Ledger!\n", fid);
+              }
+          }
+      }
+
+      // [Delta Fix] 移除所有参与 Compaction 的 L1 输入文件的污染记录
+      const auto& deleted_files = c->edit()->GetDeletedFiles();
+      for (const auto& entry : deleted_files) {
+          int level = entry.first;
+          uint64_t fid = entry.second;
+
+          // 只要文件从 Level 1 被删除（无论是被合并销毁，还是下沉到 L2）
+          // 我们都清除它的污染记录，防止 Map 内存泄漏
+          if (level == 1) {
+              hotspot_manager_->ClearL1Taint(fid);
+          }
+      }
 
       // 清理临时状态
       compaction_involved_cuids_.clear();
