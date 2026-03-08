@@ -2412,12 +2412,24 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 
   assert(get_impl_options.column_family);
 
-  // [Delta Fix]
-  // 在查找之前拦截
+  // =========================================================
+  // [Delta Fix] 核心读路优化：GDCT 拦截 + L0 精确制导
+  // =========================================================
+  ReadOptions ropts_copy = read_options;
+  std::vector<uint64_t> l0_whitelist;
+  uint64_t cuid = 0;
+
   if (hotspot_manager_) {
-    uint64_t cuid = hotspot_manager_->ExtractCUID(key);
-    if (cuid != 0 && hotspot_manager_->IsCuidDeleted(cuid)) {
-      return Status::NotFound(); // 直接短路返回
+    cuid = hotspot_manager_->ExtractCUID(key);
+    if (cuid != 0) {
+      // 1. 逻辑删除拦截：如果在 GDCT 中已标记删除，直接返回 NotFound，0 IO
+      if (hotspot_manager_->IsCuidDeleted(cuid)) {
+          return Status::NotFound();
+      }
+      
+      // 2. L0 精确路由：获取该 CUID 所在的 L0 文件白名单
+      l0_whitelist = hotspot_manager_->GetL0FilesForCuid(cuid);
+      ropts_copy.l0_file_whitelist = &l0_whitelist;
     }
   }
 
@@ -2551,15 +2563,17 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   bool done = false;
   std::string* timestamp =
       ucmp->timestamp_size() > 0 ? get_impl_options.timestamp : nullptr;
+  
   if (!skip_memtable) {
     // Get value associated with key
+    // [Delta Fix]: 使用 ropts_copy 而不是 read_options
     if (get_impl_options.get_value) {
       if (sv->mem->Get(
               lkey,
               get_impl_options.value ? get_impl_options.value->GetSelf()
                                      : nullptr,
               get_impl_options.columns, timestamp, &s, &merge_context,
-              &max_covering_tombstone_seq, read_options,
+              &max_covering_tombstone_seq, ropts_copy,
               false /* immutable_memtable */, get_impl_options.callback,
               get_impl_options.is_blob_index)) {
         done = true;
@@ -2569,6 +2583,12 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
         }
 
         RecordTick(stats_, MEMTABLE_HIT);
+
+        // // [Delta Fix]: 追踪 MemTable 引用 (GDCT 闭环)
+        if (s.ok() && hotspot_manager_ && cuid != 0) {
+           hotspot_manager_->GetDeleteTable().TrackPhysicalUnit(cuid, reinterpret_cast<uint64_t>(sv->mem));
+        }
+
       } else if ((s.ok() || s.IsMergeInProgress()) &&
                  sv->imm->Get(lkey,
                               get_impl_options.value
@@ -2576,7 +2596,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
                                   : nullptr,
                               get_impl_options.columns, timestamp, &s,
                               &merge_context, &max_covering_tombstone_seq,
-                              read_options, get_impl_options.callback,
+                              ropts_copy, get_impl_options.callback,
                               get_impl_options.is_blob_index)) {
         done = true;
 
@@ -2591,7 +2611,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
       // merged and raw values should be returned to the user.
       if (sv->mem->Get(lkey, /*value=*/nullptr, /*columns=*/nullptr,
                        /*timestamp=*/nullptr, &s, &merge_context,
-                       &max_covering_tombstone_seq, read_options,
+                       &max_covering_tombstone_seq, ropts_copy,
                        false /* immutable_memtable */, nullptr, nullptr,
                        false)) {
         done = true;
@@ -2599,7 +2619,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
       } else if ((s.ok() || s.IsMergeInProgress()) &&
                  sv->imm->GetMergeOperands(lkey, &s, &merge_context,
                                            &max_covering_tombstone_seq,
-                                           read_options)) {
+                                           ropts_copy)) {
         done = true;
         RecordTick(stats_, MEMTABLE_HIT);
       }
@@ -2615,8 +2635,11 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   PinnedIteratorsManager pinned_iters_mgr;
   if (!done) {
     PERF_TIMER_GUARD(get_from_output_files_time);
+    
+    // [Delta Fix]: 这里调用 Version::Get，必须传入 ropts_copy
+    // Version::Get 内部会读取 l0_file_whitelist 执行精确跳过
     sv->current->Get(
-        read_options, lkey, get_impl_options.value, get_impl_options.columns,
+        ropts_copy, lkey, get_impl_options.value, get_impl_options.columns,
         timestamp, &s, &merge_context, &max_covering_tombstone_seq,
         &pinned_iters_mgr,
         get_impl_options.get_value ? get_impl_options.value_found : nullptr,

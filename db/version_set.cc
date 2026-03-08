@@ -2360,6 +2360,19 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
     std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
     for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
       const auto& file = storage_info_.LevelFilesBrief(0).files[i];
+
+      // =======================================================
+      // [Delta Fix] 扫描加速：将无关 L0 文件彻底踢出归并树
+      // 遍历构建 L0 叶子节点迭代器时，如果当前文件不在白名单内，直接跳过。
+      // 这能大幅削减 Min-Heap 的节点数，提升 Next() 的归并性能。
+      // =======================================================
+      if (read_options.l0_file_whitelist != nullptr) {
+        const auto& whitelist = *read_options.l0_file_whitelist;
+        if (std::find(whitelist.begin(), whitelist.end(), file.file_metadata->fd.GetNumber()) == whitelist.end()) {
+          continue; // 不为这个死文件创建迭代器！
+        }
+      }
+
       auto table_iter = cfd_->table_cache()->NewIterator(
           read_options, soptions, cfd_->internal_comparator(),
           *file.file_metadata, /*range_del_agg=*/nullptr, mutable_cf_options_,
@@ -2382,6 +2395,8 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
       // If users execute one range query per iterator, there may be some
       // discrepancy here.
       for (FileMetaData* meta : storage_info_.LevelFiles(0)) {
+        // [Delta 注意]: 原生逻辑在这里也会遍历所有L0，为了保持采样完整性我们不做修改。
+        // 因为即使跳过了 Iterator 创建，只要是 L0 被访问，算作一层访问。
         sample_file_read_inc(meta);
       }
     }
@@ -2754,6 +2769,19 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   FdWithKeyRange* f = fp.GetNextFile();
 
   while (f != nullptr) {
+    // =======================================================
+    // [Delta Fix] L0 读放大消除：精准跳过无关的 L0 文件
+    // 如果当前搜索层是 L0，且白名单存在，且文件号不在白名单中，直接跳过！
+    // 这一步彻底省去了读取 Index Block 和 Bloom Filter 的昂贵开销。
+    // =======================================================
+    if (fp.GetHitFileLevel() == 0 && read_options.l0_file_whitelist != nullptr) {
+      const auto& whitelist = *read_options.l0_file_whitelist;
+      if (std::find(whitelist.begin(), whitelist.end(), f->file_metadata->fd.GetNumber()) == whitelist.end()) {
+        f = fp.GetNextFile(); // 提取下一个可能的文件
+        continue;             // 直接跳过当前文件
+      }
+    }
+
     if (*max_covering_tombstone_seq > 0) {
       // The remaining files we look at will only contain covered keys, so we
       // stop here.

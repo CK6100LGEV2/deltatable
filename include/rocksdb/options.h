@@ -2271,6 +2271,10 @@ struct ReadOptions {
   // an application level request that results in multiple RocksDB api calls
   const std::string* request_id = nullptr;
 
+  // [Delta Fix] 专用于 L0 读路精确制导的白名单。
+  // 如果非空，RocksDB 在读取 L0 时，将跳过不在该列表中的物理文件。
+  const std::vector<uint64_t>* l0_file_whitelist = nullptr;
+
   // *** END per-request settings for internal team use only ***
 
   ReadOptions() {}
