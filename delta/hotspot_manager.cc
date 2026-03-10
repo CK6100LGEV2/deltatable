@@ -71,14 +71,8 @@ bool HotspotManager::InterceptDelete(const Slice& key, DB* db) {
         // end_ukey 追加足够多的 0xFF，确保覆盖该 CUID 下的所有 row_id
         end_ukey.append(8, '\xFF'); 
 
-        // 3. 构造 InternalKey
-        // 对于 Start，使用 kMaxSequenceNumber 使其排在所有同 UserKey 记录的最前面
-        // 对于 End，使用 0 和最小类型，使其排在所有同 UserKey 记录的最后面
-        InternalKey start_ikey(start_ukey, kMaxSequenceNumber, kValueTypeForSeek);
-        InternalKey end_ikey(end_ukey, 0, kTypeDeletion);
-
         // 4. 评估 L1 污染并定点爆破
-        TaintL1Files(db, cuid, start_ikey, end_ikey);
+        TaintL1Files(db, cuid, Slice(start_ukey), Slice(end_ukey));
         
         return true;
     }
@@ -208,13 +202,18 @@ double HotspotManager::GetL0FileGarbageRatio(uint64_t file_num) {
     return static_cast<double>(deleted_count) / it->second.size();
 }
 
-void HotspotManager::TaintL1Files(DB* db, uint64_t cuid, const InternalKey& start, const InternalKey& end) {
+void HotspotManager::TaintL1Files(DB* db, uint64_t cuid, const Slice& start_user_key, const Slice& end_user_key) {
     DBImpl* db_impl = static_cast<DBImpl*>(db);
     std::vector<FileMetaData*> overlaps;
     auto cfd = db_impl->GetVersionSet()->GetColumnFamilySet()->GetDefault();
     auto current_version = cfd->current();
     auto* vstorage = current_version->storage_info();
-    vstorage->GetOverlappingInputs(1, &start, &end, &overlaps);
+    
+    // StartKey: 序列号设为最大，类型设为 Seek，确保包含该 UserKey 的所有版本
+    InternalKey start_ikey(start_user_key, kMaxSequenceNumber, kValueTypeForSeek);
+    // EndKey: 序列号设为 0，类型设为 Deletion，确保封住该 UserKey 的末尾
+    InternalKey end_ikey(end_user_key, 0, kTypeDeletion);
+    vstorage->GetOverlappingInputs(1, &start_ikey, &end_ikey, &overlaps);
 
     if (overlaps.empty()) return;
 

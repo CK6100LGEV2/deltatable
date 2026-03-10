@@ -102,3 +102,6 @@ cmake-build-*
 third-party/folly/
 .cache
 *.sublime-*
+
+install
+dws_log

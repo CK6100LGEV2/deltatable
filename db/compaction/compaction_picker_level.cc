@@ -580,7 +580,7 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
   WindowState best_align_window;
   
   const uint64_t kMaxCompactionBytes = mutable_cf_options_.max_compaction_bytes;
-  const double kMaxSinkWA = 5.0; // 核心阈值：写放大超过 5 倍，绝不下沉！
+  const double kMaxSinkWA = 8.0; // 核心阈值：写放大超过 5 倍，绝不下沉！
 
   for (size_t start = 0; start < total_files; ++start) {
     if (l0_files[start]->being_compacted) continue;

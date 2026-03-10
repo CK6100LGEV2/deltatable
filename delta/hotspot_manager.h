@@ -8,9 +8,9 @@
 #include "rocksdb/status.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "delta/global_delete_count_table.h"
-#include "db/dbformat.h"
 
 namespace ROCKSDB_NAMESPACE {
+class DB; // 前向声明
 
 struct ScanContext {
     uint64_t current_cuid = 0;
@@ -131,7 +131,7 @@ class HotspotManager {
   // 作用：读请求路由，闭包计算
   std::unordered_map<uint64_t, std::vector<uint64_t>> cuid_to_l0_files_;
 
-  void TaintL1Files(DB* db, uint64_t cuid, const InternalKey& start, const InternalKey& end);
+  void TaintL1Files(DB* db, uint64_t cuid, const Slice& start_user_key, const Slice& end_user_key);
 };
 
 }  // namespace ROCKSDB_NAMESPACE
