@@ -6443,7 +6443,6 @@ Status VersionSet::LogAndApply(
               // 增强型判断：如果该文件 ID 没有出现在 Level 0 的新增列表里
               // 说明它是真的被删除了，或者是去了 Level 1+
               if (added_to_l0.find(fid) == added_to_l0.end()) {
-                fprintf(stderr, "[L0-INDEX-LOG] Triggering Remove for fid: %lu (Truly left L0)\n", fid);
                 hm->RemoveL0Tracking(fid);
               } else {
                 fprintf(stderr, "[L0-INDEX-LOG] Preserving Index for fid: %lu (Intra-L0 Move detected)\n", fid);

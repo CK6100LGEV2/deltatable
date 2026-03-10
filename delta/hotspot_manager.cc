@@ -133,8 +133,6 @@ void HotspotManager::UntrackMemTableRef(uint64_t cuid, uint64_t mem_id) {
 void HotspotManager::AddL0Tracking(uint64_t file_num, const std::vector<uint64_t>& cuids) {
     std::unique_lock<std::shared_mutex> lock(l0_index_mutex_);
     
-    fprintf(stderr, "[L0-INDEX-ACTION] ADD File: %lu | CUID Count: %zu\n", file_num, cuids.size());
-    
     // 1. 更新正向索引
     l0_file_to_cuids_[file_num] = cuids;
 
@@ -154,8 +152,6 @@ void HotspotManager::RemoveL0Tracking(uint64_t file_num) {
         return; // 文件未被追踪，直接返回
     }
 
-    
-    fprintf(stderr, "[L0-INDEX-ACTION] REMOVE File: %lu\n", file_num);
     // 2. 从反向索引中移除该文件 ID
     const auto& cuids = it->second;
     for (uint64_t cuid : cuids) {

@@ -2300,7 +2300,7 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
           std::cout << "[GDCT-FATAL] Ledger Mismatch! One or more output files were not registered!" << std::endl;
       }
 
-       std::cout << "[GDCT-DEBUG] Compaction Plan: Destroying " << input_file_numbers_.size() << " files: ";
+      std::cout << "[GDCT-DEBUG] Compaction Plan: Destroying " << input_file_numbers_.size() << " files: ";
       for (auto id : input_file_numbers_) std::cout << id << " ";
       std::cout << std::endl;
 
@@ -2316,12 +2316,10 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
       for (const auto& new_file : new_files) {
           int level = new_file.first;
           uint64_t fid = new_file.second.fd.GetNumber();
-          fprintf(stderr, "[L0-INDEX-JOB] Checking New File: %lu at Level: %d\n", fid, level);
           
           if (level == 0) {
               auto it = output_cuids_.find(fid);
               if (it != output_cuids_.end()) {
-                  fprintf(stderr, "[L0-INDEX-JOB] MATCH! Registering fid: %lu to L0 Index\n", fid);
                   std::vector<uint64_t> cuid_vec(it->second.begin(), it->second.end());
                   hotspot_manager_->AddL0Tracking(fid, cuid_vec);
               } else {

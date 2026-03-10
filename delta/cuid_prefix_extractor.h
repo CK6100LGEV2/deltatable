@@ -1,4 +1,5 @@
 // CUID 前缀提取器,利用 Bloom Filter 过滤掉不包含该 CUID 的 SST 文件
+#pragma once
 #include "rocksdb/slice_transform.h"
 
 namespace ROCKSDB_NAMESPACE {

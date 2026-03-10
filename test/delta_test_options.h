@@ -1,3 +1,4 @@
+#pragma once
 #include "rocksdb/cache.h"
 #include "rocksdb/table.h"
 #include "rocksdb/filter_policy.h"
@@ -25,7 +26,7 @@ void OptimizeOptionsForDeltaOBS(rocksdb::ColumnFamilyOptions& options) {
     // 2. 物理对齐与切分 (优化 1 & 5 & 7)
     // 利用 CuidPartitioner 实现 CUID 边界对齐，减少 L0->L1 的重叠
     // 最小切分阈值设为 8MB，防止单个 CUID 数据太少导致 OBS 小文件过多
-    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(8 * 1024 * 1024);
+    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(64 * 1024 * 1024);
 
     // 3. 读路精确制导与前缀过滤 (优化 10)
     // 针对 Delta Merge 的长扫描负载进行优化
@@ -72,9 +73,12 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
     
     // NVMe 调优：触发阈值设为 8。
     // 在 NVMe 上，我们可以容忍更频繁的 Compaction 以换取更低的 L0 扫描开销
-    options.level0_file_num_compaction_trigger = 8; 
-    options.level0_slowdown_writes_trigger = 20;
-    options.level0_stop_writes_trigger = 30;
+    options.level0_file_num_compaction_trigger = 12; 
+    options.level0_slowdown_writes_trigger = 60;
+    options.level0_stop_writes_trigger = 108;
+    // options.level0_file_num_compaction_trigger = 1000000000; 
+    // options.level0_slowdown_writes_trigger = 1000000000;
+    // options.level0_stop_writes_trigger = 1000000000;
 
     // NVMe 调优：目标文件大小 64MB。
     // 兼顾 L1 元数据规模和 Compaction 并行度。
@@ -86,7 +90,7 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
     // 2. 物理对齐与切分 (优化 1 & 5 & 7)
     // NVMe 调优：最小切分阈值设为 4MB。
     // NVMe 处理小文件元数据的开销较小，更细的切分有助于 Picker 精准定位“牙签”
-    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(4 * 1024 * 1024);
+    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(8 * 1024 * 1024);
 
     // 3. 读路精确制导与前缀过滤 (优化 10)
     options.prefix_extractor.reset(new CuidPrefixExtractor());
@@ -109,7 +113,7 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
 
     // 5. 并行度与硬件优化 (NVMe 特有)
     // 使用 LZ4，这是 NVMe 存储的最佳搭档：极速压缩，CPU 开销低
-    options.compression = kLZ4Compression;
+    // options.compression = kLZ4Compression;
 
     // 6. 垃圾回收与定期维护
     options.periodic_compaction_seconds = 172800;
