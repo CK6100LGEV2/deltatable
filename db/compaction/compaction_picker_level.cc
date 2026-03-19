@@ -12,6 +12,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
@@ -74,6 +75,7 @@ class LevelCompactionBuilder {
 
 
   bool PickSmartL0ToL1Compaction();
+  bool PickSmartL1Purge();
   // Pick and return a compaction.
   Compaction* PickCompaction();
 
@@ -537,232 +539,460 @@ struct WindowState {
 
 bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
   const auto* icmp = vstorage_->InternalComparator();
-  const auto& l0_files = vstorage_->LevelFiles(0);
-  const size_t total_files = l0_files.size();
+  const auto& orig_l0_files = vstorage_->LevelFiles(0);
+  if (orig_l0_files.empty()) return false;
+
+  // ---------- global call counter (count every call) ----------
+  static std::atomic<uint64_t> global_picker_calls{0};
+  static std::atomic<uint64_t> last_primary_call{0};
+
+  const size_t total_files = orig_l0_files.size();
   const int target_level = 1;
   auto hotspot_manager = ioptions_.hotspot_manager;
 
-  if (total_files == 0) return false;
-
-  // ===========================================================
-  // 1. [优化 6] 100% 纯垃圾文件的“零成本超度” (Ghost File Drop)
-  // 利用 L0 双向全索引，在 L0 层就地物理抹除，免去任何下沉代价
-  // ===========================================================
-  if (hotspot_manager) {
-      for (size_t i = 0; i < total_files; ++i) {
-          if (l0_files[i]->being_compacted) continue;
-          
-          double garbage_ratio = hotspot_manager->GetL0FileGarbageRatio(l0_files[i]->fd.GetNumber());
-          // 容差设计：如果超过 99% 是死数据，直接作为独立的 L0->L0 任务丢弃
-          if (garbage_ratio > 0.99) {
-              start_level_inputs_.level = 0;
-              start_level_inputs_.files.push_back(l0_files[i]);
-              output_level_ = 0; // 内部清理
-              compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
-              ROCKS_LOG_INFO(ioptions_.logger, "[Delta] Zero-Cost Drop for Ghost L0 File %lu", l0_files[i]->fd.GetNumber());
-              return true;
-          }
-      }
-  }
-
-  // ===========================================================
-  // 2. 基础触发检查 (守住性能底线)
-  // ===========================================================
-  if (total_files < static_cast<size_t>(mutable_cf_options_.level0_file_num_compaction_trigger)) {
-      return false;
-  }
-
-  // ===========================================================
-  // 3.[优化 8 & 5 & 7] 贪婪滑动窗口：寻找“最小阻力”的 L0->L1 下沉路径
-  // 融合了你原版的宽窗口批量合并策略
-  // ===========================================================
-  WindowState best_sink_window;
-  WindowState best_align_window;
-  
+  const int compaction_trigger = mutable_cf_options_.level0_file_num_compaction_trigger;
+  const size_t l0_pressure_threshold = static_cast<size_t>(compaction_trigger * 1.5);
+  const size_t l0_critical_threshold = static_cast<size_t>(mutable_cf_options_.level0_slowdown_writes_trigger);
   const uint64_t kMaxCompactionBytes = mutable_cf_options_.max_compaction_bytes;
-  const double kMaxSinkWA = 8.0; // 核心阈值：写放大超过 5 倍，绝不下沉！
 
-  for (size_t start = 0; start < total_files; ++start) {
-    if (l0_files[start]->being_compacted) continue;
-    InternalKey win_smallest = l0_files[start]->smallest;
-    InternalKey win_largest = l0_files[start]->largest;
-    uint64_t win_l0_size = 0;
+  // Emergency threshold (0.8 * slowdown)
+  double emergency_frac = 0.8;
+  size_t intra_emergency_threshold = static_cast<size_t>(std::ceil(static_cast<double>(l0_critical_threshold) * emergency_frac));
+  if (intra_emergency_threshold < 1) intra_emergency_threshold = 1;
 
-    for (size_t end = start; end < total_files; ++end) {
-      FileMetaData* f = l0_files[end];
-      if (f->being_compacted) break;
+  // sorted L0 file list (key order)
+  std::vector<FileMetaData*> l0_files(orig_l0_files.begin(), orig_l0_files.end());
+  std::sort(l0_files.begin(), l0_files.end(), [&](FileMetaData* a, FileMetaData* b) {
+      return icmp->Compare(a->smallest, b->smallest) < 0;
+  });
 
-      // 更新窗口边界
-      if (icmp->Compare(f->smallest, win_smallest) < 0) win_smallest = f->smallest;
-      if (icmp->Compare(f->largest, win_largest) > 0) win_largest = f->largest;
-      win_l0_size += f->fd.GetFileSize();
-
-      // 窗口过载保护 (限制为最大允许值的一半，避免 OOM)
-      if (win_l0_size > (kMaxCompactionBytes / 2) && end > start) break;
-
-      // -------------------------------------------------------
-      // [优化 7] 严格的 CUID 闭包约束 (Closure Constraint)
-      // 防止“半个 CUID”下沉导致 L1 频繁重写
-      // -------------------------------------------------------
-      bool is_closure = true;
-      if (hotspot_manager) {
-          uint64_t head_cuid = hotspot_manager->ExtractCUID(win_smallest.user_key());
-          uint64_t tail_cuid = hotspot_manager->ExtractCUID(win_largest.user_key());
-          
-          auto check_cuid_closure = [&](uint64_t cuid_to_check) {
-              if (cuid_to_check == 0) return true;
-              auto fids = hotspot_manager->GetL0FilesForCuid(cuid_to_check);
-              // 如果这个 CUID 包含在某个不在当前窗口 [start, end] 范围内的 L0 文件中，则闭包破裂
-              for (uint64_t fid : fids) {
-                  bool found = false;
-                  for (size_t i = start; i <= end; ++i) {
-                      if (l0_files[i]->fd.GetNumber() == fid) { found = true; break; }
-                  }
-                  if (!found) return false;
-              }
-              return true;
-          };
-          
-          if (!check_cuid_closure(head_cuid) || !check_cuid_closure(tail_cuid)) {
-              is_closure = false; 
-          }
-      }
-
-      // 如果未形成闭包，拒绝下沉，但继续扩大窗口尝试包容所有碎片
-      if (!is_closure && is_closure) continue; 
-
-      // -------------------------------------------------------
-      // 核心打分：计算 L1 最小阻力 (WA)
-      // -------------------------------------------------------
-      std::vector<FileMetaData*> l1_overlaps;
-      vstorage_->GetOverlappingInputs(target_level, &win_smallest, &win_largest, &l1_overlaps);
-      uint64_t win_l1_size = 0;
-      for (const auto* l1_f : l1_overlaps) win_l1_size += l1_f->fd.GetFileSize();
-      
-      double wa = static_cast<double>(win_l0_size + win_l1_size) / win_l0_size;
-      bool is_trivial_move = (win_l1_size == 0);
-
-      // 评估 A: L0->L1 下沉 (必须满足低 WA)
-      if (wa <= kMaxSinkWA || is_trivial_move) {
-          double sink_score = 0.0;
-          if (is_trivial_move) {
-              sink_score = 1000000.0; // 零成本 Move 永远最优
-          } else {
-              // 继承你原版的优秀逻辑：奖励宽扇出批量合并
-              double efficiency = static_cast<double>(win_l0_size) / (win_l0_size + win_l1_size + 1);
-              double batch_bonus = 1.0 + (static_cast<double>(end - start) * 0.1);
-              sink_score = efficiency * batch_bonus;
-          }
-
-          if (sink_score > best_sink_window.score) {
-              best_sink_window.Update(start, end, win_l0_size, win_l1_size, sink_score, is_trivial_move);
-          }
-      }
-
-      // 评估 B: 对齐式 Intra-L0 的备选分数 (越宽越好)
-      // 如果下沉代价太高，我们总能在 L0 内部找到最宽的窗口进行对齐整理
-      double align_score = static_cast<double>(end - start + 1); 
-      if (align_score > best_align_window.score) {
-          best_align_window.Update(start, end, win_l0_size, 0, align_score, false);
+  // 1) Ghost drop
+  if (hotspot_manager) {
+    for (auto* f : l0_files) {
+      if (f->being_compacted) continue;
+      double garbage_ratio = hotspot_manager->GetL0FileGarbageRatio(f->fd.GetNumber());
+      if (garbage_ratio > 0.98) {
+        start_level_ = 0;
+        start_level_inputs_.level = 0;
+        start_level_inputs_.files.clear();
+        start_level_inputs_.files.push_back(f);
+        output_level_ = 0;
+        compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
+        std::cout << "[Delta-Smart] Ghost Drop for L0 File " << f->fd.GetNumber()
+                  << " (garbage=" << garbage_ratio << ")" << std::endl;
+        return true;
       }
     }
   }
 
-  // ===========================================================
-  // 4. 最终博弈决策 (The Execution)
-  // ===========================================================
-  
-  // 决策 A：成功找到一条代价极小的下沉路径 (WA < 5.0)
-  if (best_sink_window.start_index != -1) {
-      start_level_inputs_.level = 0;
-      for (int i = best_sink_window.start_index; i <= best_sink_window.end_index; ++i) {
-          start_level_inputs_.files.push_back(l0_files[i]);
-      }
-      output_level_ = target_level;
-      compaction_reason_ = CompactionReason::kLevelL0FilesNum;
-      
-      double final_wa = (best_sink_window.l0_bytes > 0) ? 
-          (static_cast<double>(best_sink_window.l0_bytes + best_sink_window.l1_bytes) / best_sink_window.l0_bytes) : 1.0;
-      
-      ROCKS_LOG_BUFFER(log_buffer_, 
-          "[Delta-Smart] Least-Resistance L0->L1. Files: %d-%d, WA: %.1fx, Mode: %s", 
-          best_sink_window.start_index, best_sink_window.end_index, final_wa,
-          best_sink_window.is_trivial_move ? "Move" : "Merge");
-          
-      return true;
+  // If not yet over trigger, skip smart heavy logic
+  if (total_files < static_cast<size_t>(compaction_trigger)) {
+    return false;
   }
 
-  // 决策 B：[优化 3] 被动对齐式 Intra-L0 降级 (L1 封锁，强制熔断)
-  // 如果所有窗口的 WA 都大于 5.0，说明 L1 层在该区域太厚了。
-  // 我们利用 CuidPartitioner 在 L0 原地把碎片切成规整的“牙签”，为未来的低代价下沉做铺垫。
-  if (best_align_window.start_index != -1) {
-      start_level_inputs_.level = 0;
-      
-      // 为了防止单次耗时过长，我们只取 L0 最早生成的几个文件进行降级合并
-      int intra_end = static_cast<int>(total_files) - 1;
-      int intra_start = std::max(0, intra_end - 4); 
-      for (int i = intra_start; i <= intra_end; ++i) {
-          if (!l0_files[i]->being_compacted) start_level_inputs_.files.push_back(l0_files[i]);
+  // Precompute L1 pressure (taint-aware)
+  uint64_t global_effective_l1 = 0;
+  uint64_t global_raw_l1 = 0;
+  const auto& l1_files_all = vstorage_->LevelFiles(1);
+  for (const auto* lf : l1_files_all) {
+    uint64_t sz = lf->fd.GetFileSize();
+    global_raw_l1 += sz;
+    double taint_ratio = 0.0;
+    if (hotspot_manager) {
+      taint_ratio = hotspot_manager->GetL1FileTaintRatio(lf->fd.GetNumber(), sz);
+      if (taint_ratio < 0.0) taint_ratio = 0.0;
+      if (taint_ratio > 1.0) taint_ratio = 1.0;
+    }
+    uint64_t eff = static_cast<uint64_t>(sz * (1.0 - taint_ratio));
+    global_effective_l1 += std::max<uint64_t>(1, eff);
+  }
+  uint64_t l1_capacity = std::max<uint64_t>(1, mutable_cf_options_.max_bytes_for_level_base);
+  double l1_pressure_ratio = static_cast<double>(global_effective_l1) / static_cast<double>(l1_capacity);
+
+  // Search best sink (L0->L1)
+  double best_sink_score = -1.0;
+  std::vector<FileMetaData*> best_sink_group;
+  uint64_t best_sink_raw_l0 = 0;
+  uint64_t best_sink_effective_l1 = 0;
+  bool best_is_trivial = false;
+
+  const size_t kMaxGroupFiles = std::max(static_cast<size_t>(total_files / 1.5), static_cast<size_t>(12));
+  const double trivial_bonus = 2.0; // modest boost for trivial moves
+
+  // base scoring controls (moderate)
+  const double primary_base_score = 2e-9;      // baseline for "good" candidate
+  const double fallback_min_score = 5e-10;    // permissive fallback bar
+
+  auto compute_backlog_multiplier = [&](size_t files)->double {
+    double m = 1.0;
+    if (files > static_cast<size_t>(compaction_trigger)) {
+      m += (static_cast<double>(files) / static_cast<double>(compaction_trigger) - 1.0) * 0.35;
+      if (m > 2.5) m = 2.5;
+    }
+    return m;
+  };
+
+  for (size_t i = 0; i < total_files; ++i) {
+    FileMetaData* seed = l0_files[i];
+    if (seed->being_compacted) continue;
+
+    // build overlap-connected component (cap group size)
+    std::vector<FileMetaData*> group_files;
+    group_files.push_back(seed);
+    InternalKey group_smallest = seed->smallest;
+    InternalKey group_largest = seed->largest;
+    bool expanded = true;
+    while (expanded && group_files.size() < kMaxGroupFiles) {
+      expanded = false;
+      for (size_t j = 0; j < total_files && group_files.size() < kMaxGroupFiles; ++j) {
+        FileMetaData* f = l0_files[j];
+        if (f->being_compacted) continue;
+        if (std::find(group_files.begin(), group_files.end(), f) != group_files.end()) continue;
+        if (icmp->Compare(f->largest, group_smallest) >= 0 &&
+            icmp->Compare(f->smallest, group_largest) <= 0) {
+          group_files.push_back(f);
+          if (icmp->Compare(f->smallest, group_smallest) < 0) group_smallest = f->smallest;
+          if (icmp->Compare(f->largest, group_largest) > 0) group_largest = f->largest;
+          expanded = true;
+        }
       }
-      
-      if (start_level_inputs_.files.size() >= 2) {
-          output_level_ = 0; 
+    }
+
+    // compute sizes and garbage hints
+    uint64_t group_raw_l0 = 0;
+    uint64_t group_effective_l0 = 0;
+    double avg_l0_garbage = 0.0;
+    for (auto* f : group_files) {
+      uint64_t sz = f->fd.GetFileSize();
+      group_raw_l0 += sz;
+      double l0_garbage = 0.0;
+      if (hotspot_manager) l0_garbage = hotspot_manager->GetL0FileGarbageRatio(f->fd.GetNumber());
+      avg_l0_garbage += l0_garbage;
+      uint64_t effective_sz = static_cast<uint64_t>(sz * (1.0 - l0_garbage));
+      group_effective_l0 += std::max<uint64_t>(1, effective_sz);
+    }
+    if (!group_files.empty()) avg_l0_garbage /= static_cast<double>(group_files.size());
+
+    // overlapping L1 inputs
+    std::vector<FileMetaData*> l1_overlaps;
+    vstorage_->GetOverlappingInputs(target_level, &group_smallest, &group_largest, &l1_overlaps);
+
+    uint64_t group_effective_l1 = 0;
+    uint64_t group_raw_l1 = 0;
+    double avg_l1_taint = 0.0;
+    for (const auto* l1_f : l1_overlaps) {
+      uint64_t l1_sz = l1_f->fd.GetFileSize();
+      group_raw_l1 += l1_sz;
+      double taint_ratio = 0.0;
+      if (hotspot_manager) {
+        taint_ratio = hotspot_manager->GetL1FileTaintRatio(l1_f->fd.GetNumber(), l1_sz);
+        if (taint_ratio < 0.0) taint_ratio = 0.0;
+        if (taint_ratio > 1.0) taint_ratio = 1.0;
+      }
+      avg_l1_taint += taint_ratio;
+      double taint_boost = 1.0;
+      if (taint_ratio > 0.2) taint_boost = 0.9; // mild favor to dirty L1
+      uint64_t effective_l1_piece = static_cast<uint64_t>(l1_sz * (1.0 - taint_ratio) * taint_boost);
+      group_effective_l1 += std::max<uint64_t>(1, effective_l1_piece);
+    }
+    if (!l1_overlaps.empty()) avg_l1_taint /= static_cast<double>(l1_overlaps.size());
+
+    bool is_trivial = l1_overlaps.empty();
+
+    // compute wa (effective)
+    double wa = static_cast<double>(group_effective_l0 + group_effective_l1) / static_cast<double>(group_effective_l0);
+
+    // compute benefit & write_cost
+    double garbage_cleanup = 0.0;
+    if (group_raw_l0 > 0) {
+      garbage_cleanup = static_cast<double>(group_raw_l0 - group_effective_l0) / static_cast<double>(group_raw_l0);
+    }
+    double backlog_multiplier = compute_backlog_multiplier(total_files);
+    double hotspot_bonus = 1.0 + avg_l0_garbage * 1.2; // modest boost for cleanup potential
+    double compactness_bonus = 1.0;
+    if ((group_raw_l1 + group_raw_l0) > 0) {
+      double overlap_ratio = static_cast<double>(group_raw_l1) / static_cast<double>(group_raw_l1 + group_raw_l0);
+      compactness_bonus = 1.0 + (1.0 - overlap_ratio) * 0.8;
+    }
+
+    double benefit = static_cast<double>(group_files.size()) * (1.0 + 1.2 * garbage_cleanup) * backlog_multiplier * hotspot_bonus * compactness_bonus;
+    double write_cost = static_cast<double>(group_effective_l0 + group_effective_l1);
+
+    // mild overlap penalty (sqrt scale)
+    double overlap_ratio = 0.0;
+    if ((group_raw_l1 + group_raw_l0) > 0) {
+      overlap_ratio = static_cast<double>(group_raw_l1) / static_cast<double>(group_raw_l1 + group_raw_l0);
+    }
+    double overlap_penalty = std::sqrt(1.0 + overlap_ratio);
+
+    // score: penalize wa with power 1.5 (sensitive to larger WA but not square)
+    double score = 0.0;
+    if (write_cost > 0.0) {
+      score = benefit / (write_cost * std::pow(std::max(1.0, wa), 1.5) * overlap_penalty);
+    }
+
+    if (is_trivial) score *= trivial_bonus;
+
+    // size penalty for overly large groups
+    if (group_raw_l0 > kMaxCompactionBytes) {
+      double size_penalty = sqrt(static_cast<double>(kMaxCompactionBytes) / static_cast<double>(group_raw_l0));
+      score *= size_penalty;
+    }
+
+    // keep best candidate
+    if (score > best_sink_score) {
+      best_sink_score = score;
+      best_sink_group = group_files;
+      best_sink_raw_l0 = group_raw_l0;
+      best_sink_effective_l1 = group_effective_l1;
+      best_is_trivial = is_trivial;
+    }
+  } // end for seeds
+
+  // compute best intra-L0 candidate (for emergency/housekeeping)
+  double best_align_score = -1.0;
+  std::vector<FileMetaData*> best_align_files;
+  double intra_priority_multiplier = 1.0;
+  if (total_files >= static_cast<size_t>(compaction_trigger) * 2) {
+    intra_priority_multiplier = std::min(2.0, 1.0 + (static_cast<double>(total_files) / static_cast<double>(compaction_trigger) - 2.0) * 0.25);
+  }
+  for (size_t win = 3; win <= 8; ++win) {
+    if (total_files < win) break;
+    for (size_t i = 0; i + win <= total_files; ++i) {
+      bool valid = true;
+      uint64_t window_raw_size = 0;
+      std::vector<FileMetaData*> window_files;
+      window_files.reserve(win);
+      for (size_t j = 0; j < win; ++j) {
+        FileMetaData* f = l0_files[i + j];
+        if (f->being_compacted) { valid = false; break; }
+        window_files.push_back(f);
+        window_raw_size += f->fd.GetFileSize();
+      }
+      if (!valid) continue;
+      uint64_t threshold = mutable_cf_options_.target_file_size_base * 3;
+      if (window_raw_size > threshold * static_cast<uint64_t>(intra_priority_multiplier)) continue;
+      double window_score = static_cast<double>(window_files.size()) * intra_priority_multiplier / (std::sqrt(static_cast<double>(window_raw_size)) + 1.0);
+      if (window_score > best_align_score) {
+        best_align_score = window_score;
+        best_align_files = window_files;
+      }
+    }
+  }
+
+  // Decision logic: adaptive but conservative
+  // compute scaled primary threshold (start moderate)
+  double scaled_primary_threshold = primary_base_score * (1.0 + l1_pressure_ratio * 3.5);
+  // relax when L0 grows, but gently (avoid accepting garbage)
+  if (total_files >= static_cast<size_t>(compaction_trigger) * 2) scaled_primary_threshold *= 0.7;
+  if (total_files >= static_cast<size_t>(compaction_trigger) * 3) scaled_primary_threshold *= 0.5;
+
+  // compute final WA estimate for best candidate
+  double final_wa = 0.0;
+  if (best_sink_raw_l0 > 0) final_wa = static_cast<double>(best_sink_raw_l0 + best_sink_effective_l1) / static_cast<double>(best_sink_raw_l0);
+
+  // Primary acceptance rules (strict WA, moderate score, small rate limit)
+  double primary_allowed_wa = best_is_trivial ? 3.0 : 2.5; // trivial move allowed a little more
+  const uint64_t min_primary_interval_calls = 2; // don't primary every picker call
+  uint64_t last_primary = last_primary_call.load(std::memory_order_relaxed);
+
+  if (best_sink_group.size() >= 2 && best_sink_score > scaled_primary_threshold) {
+    if (final_wa <= primary_allowed_wa) {
+      // rate limit to avoid continuous primary churn
+        std::sort(best_sink_group.begin(), best_sink_group.end(),
+                  [](FileMetaData* a, FileMetaData* b) { return a->fd.GetNumber() > b->fd.GetNumber(); });
+        start_level_ = 0;
+        start_level_inputs_.level = 0;
+        start_level_inputs_.files = best_sink_group;
+        output_level_ = target_level;
+        compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+        std::cout << "[Delta-Smart] PRIMARY Sink chosen: files=" << best_sink_group.size()
+                  << " score=" << best_sink_score << " WA=" << final_wa
+                  << " trivial=" << (int)best_is_trivial << " L0=" << total_files << std::endl;
+        return true;
+    } else {
+      std::cout << "[Delta-Smart] PRIMARY candidate rejected for WA " << final_wa << " > allowed " << primary_allowed_wa << " (L0=" << total_files << ")\n";
+    }
+  }
+
+  // Emergency Intra-L0: when L0 reaches emergency threshold (fast brake)
+  if (total_files >= intra_emergency_threshold) {
+    if (!best_align_files.empty()) {
+      start_level_ = 0;
+      start_level_inputs_.level = 0;
+      start_level_inputs_.files = best_align_files;
+      output_level_ = 0;
+      compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+      std::cout << "[Delta-Smart] Emergency Intra-L0 triggered (L0=" << total_files
+                << " >= emergency=" << intra_emergency_threshold << "), window_files=" << best_align_files.size()
+                << " score=" << best_align_score << std::endl;
+      return true;
+    } else {
+      // simple pair fallback
+      for (size_t i = 0; i + 1 < total_files; ++i) {
+        FileMetaData* a = l0_files[i];
+        FileMetaData* b = l0_files[i+1];
+        if (!a->being_compacted && !b->being_compacted) {
+          start_level_ = 0;
+          start_level_inputs_.level = 0;
+          start_level_inputs_.files.clear();
+          start_level_inputs_.files.push_back(a);
+          start_level_inputs_.files.push_back(b);
+          output_level_ = 0;
           compaction_reason_ = CompactionReason::kLevelL0FilesNum;
-          ROCKS_LOG_WARN(ioptions_.logger, 
-              "[Delta-Smart] L1 Blockaded (WA > 5.0). Executing Passive Aligned Intra-L0.");
+          std::cout << "[Delta-Smart] Emergency Intra-L0 fallback (pair) triggered." << std::endl;
+          return true;
+        }
+      }
+    }
+  }
+
+  uint64_t call_idx = global_picker_calls.fetch_add(1, std::memory_order_relaxed);
+
+  // periodic housekeeping intra (low freq)
+  const uint64_t housekeeping_interval = 8;
+  if ((call_idx % housekeeping_interval) == 0) {
+    if (total_files >= static_cast<size_t>(compaction_trigger) * 2 && !best_align_files.empty()) {
+      start_level_ = 0;
+      start_level_inputs_.level = 0;
+      start_level_inputs_.files = best_align_files;
+      output_level_ = 0;
+      compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+      std::cout << "[Delta-Smart] Housekeeping Intra-L0 triggered (periodic). window_files="
+                << best_align_files.size() << " score=" << best_align_score << std::endl;
+      return true;
+    }
+  }
+
+  // Controlled Fallback sink (only when L0 is overloaded)
+  if (total_files >= static_cast<size_t>(intra_emergency_threshold* 0.75)  && best_sink_group.size() >= 2) {
+    double fallback_allowed_wa = 4.0; // permissive but bounded
+    if (total_files >= static_cast<size_t>(compaction_trigger) * 3) {
+      fallback_allowed_wa = 6.0; // last resort if extremely overloaded
+    }
+    if (best_sink_score > fallback_min_score && final_wa <= fallback_allowed_wa) {
+      std::sort(best_sink_group.begin(), best_sink_group.end(),
+                [](FileMetaData* a, FileMetaData* b) { return a->fd.GetNumber() > b->fd.GetNumber(); });
+      start_level_ = 0;
+      start_level_inputs_.level = 0;
+      start_level_inputs_.files = best_sink_group;
+      output_level_ = target_level;
+      compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+      std::cout << "[Delta-Smart] FALLBACK Sink chosen: files=" << best_sink_group.size()
+                << " score=" << best_sink_score << " WA=" << final_wa << " (L0=" << total_files << ")" << std::endl;
+      return true;
+    } else {
+      std::cout << "[Delta-Smart] No acceptable fallback sink (best_score=" << best_sink_score
+                << " WA=" << final_wa << " L0=" << total_files << ")" << std::endl;
+    }
+  }
+
+  // Nothing selected
+  return false;
+}
+
+bool LevelCompactionBuilder::PickSmartL1Purge() {
+  auto hotspot_manager = ioptions_.hotspot_manager;
+  if (!hotspot_manager) return false;
+
+  const auto& l1_files = vstorage_->LevelFiles(1);
+  if (l1_files.empty()) return false;
+
+  for (size_t i = 0; i < l1_files.size(); ++i) {
+      FileMetaData* f = l1_files[i];
+      if (f->being_compacted) continue;
+
+      double taint_ratio = hotspot_manager->GetL1FileTaintRatio(f->fd.GetNumber(), f->fd.GetFileSize());
+
+      // 陨石坑爆破
+      if (taint_ratio > 0.3) {
+          start_level_ = 1; // 【关键修复】主动宣告接管 L1
+          start_level_inputs_.level = 1;
+          start_level_inputs_.files.push_back(f);
+          
+          output_level_ = 1; 
+          compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
+
+          std::cout <<
+              "[Delta-Smart] L1 Meteor Crater! File: " << f->fd.GetNumber() << ", Taint: " << taint_ratio * 100.0 << "%. Triggering L1->L1 GC." << std::endl;
           return true;
       }
   }
-
   return false;
 }
 
 Compaction* LevelCompactionBuilder::PickCompaction() {
-  // 1. 优先尝试我们的 Smart L0->L1 Picker
+  start_level_inputs_.clear();
+  output_level_inputs_.clear();
+  compaction_inputs_.clear();
+
+  // 1. 优先尝试我们的 Smart L0->L1 Picker (主动触发 L0)
   if (PickSmartL0ToL1Compaction()) {
       bool setup_ok = true;
-
       if (output_level_ != start_level_) {
-          // 情况 A: 跨层合并 (L0 -> L1)，必须去目标层拉取重叠文件
           setup_ok = SetupOtherInputsIfNeeded();
       } else {
-          // 情况 B: 同层合并 (Intra-L0)，不需要去“目标层”找了
-          // 因为目标层就是自己，且 Smart Picker 已经精确计算好了范围
-          setup_ok = true; 
+          // 同层合并 (Intra-L0)
+          // 手动同步状态，否则 GetCompaction 会断言失败
+          if (!start_level_inputs_.empty()) {
+              compaction_inputs_.push_back(start_level_inputs_);
+              setup_ok = true; 
+          } else {
+              setup_ok = false;
+          }
       }
 
       if (setup_ok) {
-          Compaction* c = GetCompaction();
-          if (c != nullptr) return c;
+          if (compaction_inputs_.empty()) {
+              std::cout<<"[Delta-Smart] Logic Error: compaction_inputs_ is still empty.\n";
+          } else {
+              Compaction* c = GetCompaction();
+              if (c != nullptr) {
+                  TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+                  return c;
+              }
+              std::cout<<"[Delta-Smart] Warning: GetCompaction() returned nullptr. Fallback invoked."<<std::endl;
+          } 
       }
       
-      // 只有真正失败时才清理
+      // 失败清理，复位 start_level_
       start_level_inputs_.clear();
       output_level_inputs_.clear();
+      compaction_inputs_.clear();
+      start_level_ = -1; 
+      output_level_ = -1;
   }
 
-  // 2. 如果 Smart Picker 没选中（例如文件数不够，或都在忙），
-  //    回退到 RocksDB 原生逻辑作为保底
-  SetupInitialFiles();
-  if (start_level_inputs_.empty()) {
-    return nullptr;
+  // 2. 尝试 L1 陨石坑定点 GC (主动触发 L1)
+  if (PickSmartL1Purge()) {
+      Compaction* c = GetCompaction(); // L1->L1 原地合并，不需要 SetupOtherInputs
+      if (c != nullptr) {
+          TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
+          std::cout<<"[Delta-Smart] L1 GC Compaction picked successfully."<<std::endl;
+          return c;
+      }
+      
+      // 失败清理，复位
+      start_level_inputs_.clear();
+      output_level_inputs_.clear();
+      compaction_inputs_.clear();
+      start_level_ = -1;
+      output_level_ = -1;
   }
+
+  // 3. 原生兜底逻辑
+  // 注意：只有走到这里，RocksDB 原生逻辑才会计算分数，并把 start_level_ 设置为 0 或 1
+  SetupInitialFiles();
+  if (start_level_inputs_.empty()) return nullptr;
   assert(start_level_ >= 0 && output_level_ >= 0);
 
-  if (!SetupOtherL0FilesIfNeeded()) {
-    return nullptr;
-  }
-  if (!SetupOtherInputsIfNeeded()) {
-    return nullptr;
-  }
+  if (!SetupOtherL0FilesIfNeeded()) return nullptr;
+  if (!SetupOtherInputsIfNeeded()) return nullptr;
 
   Compaction* c = GetCompaction();
-
   TEST_SYNC_POINT_CALLBACK("LevelCompactionPicker::PickCompaction:Return", c);
-
   return c;
 }
-
 
 /*Compaction* LevelCompactionBuilder::PickCompaction() {
   // Pick up the first file to start compaction. It may have been extended

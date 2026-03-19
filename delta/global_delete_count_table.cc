@@ -1,93 +1,95 @@
-// delta/global_delete_count_table.cc
-
 #include "delta/global_delete_count_table.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 bool GlobalDeleteCountTable::TrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto& entry = table_[cuid]; // Lazy Init
-  
-  if (entry.tracked_phys_ids.find(phys_id) == entry.tracked_phys_ids.end()) {
-    entry.tracked_phys_ids.insert(phys_id);
-    return true; // 新文件，Ref++
-  }
-  return false;
+    bool inserted = false;
+    table_.lazy_emplace_l(cuid,[&](auto& v) { // Key 已存在，获取分片写锁
+            if (v.second.tracked_phys_ids.find(phys_id) == v.second.tracked_phys_ids.end()) {
+                v.second.tracked_phys_ids.insert(phys_id);
+                inserted = true;
+            }
+        },
+        [&](const auto& ctor) { // Key 不存在，获取分片写锁进行初始化
+            GDCTEntry entry;
+            entry.tracked_phys_ids.insert(phys_id);
+            ctor(cuid, std::move(entry));
+            inserted = true;
+        }
+    );
+    return inserted;
 }
 
 bool GlobalDeleteCountTable::UntrackPhysicalUnit(uint64_t cuid, uint64_t phys_id) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
-  if (it != table_.end()) {
-    it->second.tracked_phys_ids.erase(phys_id);
-    
-    // 物理引用归零且逻辑已删除 -> 执行 GC
-    if (it->second.is_deleted && it->second.tracked_phys_ids.empty()) {
-        table_.erase(it);
-        return true; // [核心修复] 返回信号：我被删掉了
+    bool do_erase = false;
+    table_.modify_if(cuid, [&](auto& v) { // 获取分片写锁
+        v.second.tracked_phys_ids.erase(phys_id);
+        if (v.second.tracked_phys_ids.empty() && v.second.is_deleted) {
+            do_erase = true;
+        }
+    });
+    if (do_erase) {
+        table_.erase(cuid);
+        return true;
     }
-  }
-  return false;
+    return false;
 }
 
-// 用于 L0Compaction 对 delete cuid 的清理
 void GlobalDeleteCountTable::UntrackFiles(uint64_t cuid, const std::vector<uint64_t>& file_ids) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
-  if (it != table_.end()) {
-    // 遍历本次 Compaction 的所有输入文件
-    for (uint64_t fid : file_ids) {
-      it->second.tracked_phys_ids.erase(fid);
+    bool do_erase = false;
+    table_.modify_if(cuid, [&](auto& v) { // 获取分片写锁
+        for (uint64_t fid : file_ids) {
+            v.second.tracked_phys_ids.erase(fid);
+        }
+        if (v.second.tracked_phys_ids.empty() && v.second.is_deleted) {
+            do_erase = true;
+        }
+    });
+    if (do_erase) {
+        table_.erase(cuid);
     }
-    // 检查是否归零且标记删除，如果是则清理条目
-    if (it->second.tracked_phys_ids.empty() && it->second.is_deleted) {
-      table_.erase(it);
-    }
-  }
 }
 
 bool GlobalDeleteCountTable::MarkDeleted(uint64_t cuid) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
-  if (it != table_.end()) {
-    it->second.is_deleted = true;
-    return true; 
-  }
-  return false;
+    bool marked = false;
+    table_.lazy_emplace_l(cuid,
+        [&](auto& v) { v.second.is_deleted = true; marked = true; },
+        [&](const auto& ctor) {
+            GDCTEntry entry;
+            entry.is_deleted = true;
+            ctor(cuid, std::move(entry));
+            marked = true;
+        }
+    );
+    return marked;
 }
 
 bool GlobalDeleteCountTable::IsDeleted(uint64_t cuid) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);  
-  if (it != table_.end()) {
-    return it->second.is_deleted;
-  }
-  return false;
+    bool deleted = false;
+    table_.if_contains(cuid, [&](const auto& v) { // 获取分片读锁 (并发极为高效)
+        deleted = v.second.is_deleted;
+    });
+    return deleted;
 }
 
 int GlobalDeleteCountTable::GetRefCount(uint64_t cuid) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  auto it = table_.find(cuid);
-  if (it != table_.end()) {
-    return it->second.GetRefCount();
-  }
-  return 0;
+    int ref = 0;
+    table_.if_contains(cuid, [&](const auto& v) {
+        ref = v.second.GetRefCount();
+    });
+    return ref;
 }
 
 bool GlobalDeleteCountTable::IsTracked(uint64_t cuid) const {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  return table_.find(cuid) != table_.end();
+    return table_.contains(cuid);
 }
 
-// 获取该 CUID 目前分布在哪些文件里
 std::vector<uint64_t> GlobalDeleteCountTable::GetTrackedFiles(uint64_t cuid) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto it = table_.find(cuid);
-    if (it != table_.end()) {
-        return std::vector<uint64_t>(it->second.tracked_phys_ids.begin(), 
-                                      it->second.tracked_phys_ids.end());
-    }
-    return {};
+    std::vector<uint64_t> res;
+    table_.if_contains(cuid, [&](const auto& v) { // 获取分片读锁，内部安全拷贝
+        res.assign(v.second.tracked_phys_ids.begin(), v.second.tracked_phys_ids.end());
+    });
+    return res;
 }
 
 std::vector<uint64_t> GlobalDeleteCountTable::AtomicCompactionUpdate(
@@ -95,28 +97,28 @@ std::vector<uint64_t> GlobalDeleteCountTable::AtomicCompactionUpdate(
     const std::vector<uint64_t>& input_files,
     const std::map<uint64_t, std::unordered_set<uint64_t>>& output_file_to_cuids) {
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
     std::vector<uint64_t> gc_cuids;
 
-    // 1. 加新账 (不变)
+    // 1. 加新账 (安全插入)
     for (const auto& pair : output_file_to_cuids) {
         for (uint64_t cuid : pair.second) {
-            table_[cuid].tracked_phys_ids.insert(pair.first);
+            TrackPhysicalUnit(cuid, pair.first);
         }
     }
 
     // 2. 销旧账
     for (uint64_t cuid : involved_cuids) {
-        auto it = table_.find(cuid);
-        if (it == table_.end()) continue;
-
-        for (uint64_t old_fid : input_files) {
-            it->second.tracked_phys_ids.erase(old_fid);
-        }
-
-        // 3. 垃圾回收检查
-        if (it->second.tracked_phys_ids.empty() && it->second.is_deleted) {
-            table_.erase(it);
+        bool do_erase = false;
+        table_.modify_if(cuid, [&](auto& v) {
+            for (uint64_t old_fid : input_files) {
+                v.second.tracked_phys_ids.erase(old_fid);
+            }
+            if (v.second.tracked_phys_ids.empty() && v.second.is_deleted) {
+                do_erase = true;
+            }
+        });
+        if (do_erase) {
+            table_.erase(cuid);
             gc_cuids.push_back(cuid);
         }
     }

@@ -73,27 +73,30 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
     
     // NVMe 调优：触发阈值设为 8。
     // 在 NVMe 上，我们可以容忍更频繁的 Compaction 以换取更低的 L0 扫描开销
-    options.level0_file_num_compaction_trigger = 12; 
-    options.level0_slowdown_writes_trigger = 60;
-    options.level0_stop_writes_trigger = 108;
+    options.level0_file_num_compaction_trigger = 8; 
+    options.level0_slowdown_writes_trigger = 40;
+    options.level0_stop_writes_trigger = 72;
+    options.soft_pending_compaction_bytes_limit = 0;
     // options.level0_file_num_compaction_trigger = 1000000000; 
     // options.level0_slowdown_writes_trigger = 1000000000;
     // options.level0_stop_writes_trigger = 1000000000;
 
-    // NVMe 调优：目标文件大小 64MB。
+    // NVMe 调优：目标文件大小 64MB
     // 兼顾 L1 元数据规模和 Compaction 并行度。
-    options.target_file_size_base = 64 * 1024 * 1024;
+    options.write_buffer_size = 128 * 1024 * 1024;
+    options.target_file_size_base = 128 * 1024 * 1024;
     
     // L1 的基准大小，设为极高 (100TB)
     options.max_bytes_for_level_base = 100ULL * 1024 * 1024 * 1024 * 1024;
 
     // 2. 物理对齐与切分 (优化 1 & 5 & 7)
-    // NVMe 调优：最小切分阈值设为 4MB。
+    // NVMe 调优：最小切分阈值设为 16MB。
     // NVMe 处理小文件元数据的开销较小，更细的切分有助于 Picker 精准定位“牙签”
-    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(8 * 1024 * 1024);
+    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(16 * 1024 * 1024);
 
     // 3. 读路精确制导与前缀过滤 (优化 10)
     options.prefix_extractor.reset(new CuidPrefixExtractor());
+    options.memtable_prefix_bloom_size_ratio = 0.1;
 
     BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
@@ -101,7 +104,7 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
 
     // 4. 元数据全内存化 (优化 10 & 2)
     table_options.cache_index_and_filter_blocks = true;
-    table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+    table_options.pin_l0_filter_and_index_blocks_in_cache = false;
     table_options.pin_top_level_index_and_filter = true;
     table_options.cache_index_and_filter_blocks_with_high_priority = true;
 
@@ -117,7 +120,7 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
 
     // 6. 垃圾回收与定期维护
     options.periodic_compaction_seconds = 172800;
-    options.max_compaction_bytes = 1024 * 1024 * 1024; // 1GB
+    options.max_compaction_bytes = 1 * 1024 * 1024 * 1024; // 1GB
 }
 
 // 获取针对 L1 扫描优化的 ReadOptions

@@ -1698,6 +1698,9 @@ if(WITH_BENCHMARK)
 endif()
 
 # for delta
+
+include_directories(${PROJECT_SOURCE_DIR}/third-party/parallel-hashmap)
+
 add_executable(rocksdb_delta_test test/rocksdb_delta_test.cc db/db_test_util.cc)
 target_link_libraries(rocksdb_delta_test rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
 
