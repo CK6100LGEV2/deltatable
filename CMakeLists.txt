@@ -1709,3 +1709,6 @@ target_link_libraries(rocksdb_l0index_test rocksdb testharness gtest ${THIRDPART
 
 add_executable(rocksdb_delta_nvme_bench test/rocksdb_delta_nvme_bench.cc)
 target_link_libraries(rocksdb_delta_nvme_bench rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+
+add_executable(rocksdb_delta_cf16_bench test/rocksdb_delta_cf16_bench.cc)
+target_link_libraries(rocksdb_delta_cf16_bench rocksdb testharness gtest ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})

@@ -41,7 +41,7 @@ class HotspotManager {
   GlobalDeleteCountTable& GetDeleteTable() { return delete_table_; }
 
   bool IsCuidDeleted(uint64_t cuid) { return delete_table_.IsDeleted(cuid); }
-  bool InterceptDelete(const Slice& key, DB* db);
+  bool InterceptDelete(const Slice& key, DB* db, ColumnFamilyHandle* cfh);
   uint64_t ExtractCUID(const Slice& key);
 
   void RegisterFileRefs(uint64_t file_number, uint64_t file_size, const std::unordered_set<uint64_t>& cuids);
@@ -73,7 +73,7 @@ class HotspotManager {
   L0IndexMap l0_file_to_cuids_;
   L0IndexMap cuid_to_l0_files_;
 
-  void TaintL1Files(DB* db, uint64_t cuid, const Slice& start_user_key, const Slice& end_user_key);
+  void TaintL1Files(DB* db, ColumnFamilyHandle* cfh, uint64_t cuid, const Slice& start_user_key, const Slice& end_user_key);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

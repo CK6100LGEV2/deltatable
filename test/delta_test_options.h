@@ -83,8 +83,8 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
 
     // NVMe 调优：目标文件大小 64MB
     // 兼顾 L1 元数据规模和 Compaction 并行度。
-    options.write_buffer_size = 128 * 1024 * 1024;
-    options.target_file_size_base = 128 * 1024 * 1024;
+    options.write_buffer_size = 8 * 1024 * 1024;
+    options.target_file_size_base = 8 * 1024 * 1024;
     
     // L1 的基准大小，设为极高 (100TB)
     options.max_bytes_for_level_base = 100ULL * 1024 * 1024 * 1024 * 1024;
@@ -92,7 +92,7 @@ void OptimizeOptionsForDeltaNVME(rocksdb::ColumnFamilyOptions& options) {
     // 2. 物理对齐与切分 (优化 1 & 5 & 7)
     // NVMe 调优：最小切分阈值设为 16MB。
     // NVMe 处理小文件元数据的开销较小，更细的切分有助于 Picker 精准定位“牙签”
-    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(16 * 1024 * 1024);
+    options.sst_partitioner_factory = std::make_shared<CuidPartitionerFactory>(2 * 1024 * 1024);
 
     // 3. 读路精确制导与前缀过滤 (优化 10)
     options.prefix_extractor.reset(new CuidPrefixExtractor());

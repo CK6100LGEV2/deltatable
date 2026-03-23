@@ -33,8 +33,8 @@ const int kNumPartitions = 16; // 16 分区 (Column Families)
 
 const uint64_t kTotalCUIDs = 100000;
 const uint64_t kHotPoolSize = 1500;
-const uint64_t kScanThresholdMin = 2000; 
-const uint64_t kScanThresholdMax = 4000;
+const uint64_t kScanThresholdMin = 4000; 
+const uint64_t kScanThresholdMax = 6000;
 const int kValueSize = 1024;
 const int kBatchSize = 128;
 const int kTestDurationSecs = 300;
@@ -183,7 +183,13 @@ void WorkerThread(DB* db, const std::vector<ColumnFamilyHandle*>& handles, int t
                 --i; continue;
             }
 
-            EncodeDeltaKeyInPlace(key_buf, cuid, seq);
+            // 【核心修改】：模拟覆盖写 (Update/Overwrite)
+            // 不再使用单调递增的 seq 作为 Key 的末尾，而是使用随机 RowID。
+            // 这样新生成的 L0 文件 Key 范围会与 L1 里的旧数据产生物理重叠，
+            // 从而禁用 Trivial Move，逼迫 Smart Picker 执行真正的归并计算。
+            // 建议范围设在 0 ~ 5000 左右，确保 Key 空间既紧凑又有足够的碰撞概率。
+            uint64_t random_row_id = rng() % 5000; 
+            EncodeDeltaKeyInPlace(key_buf, cuid, random_row_id);
             
             // 【核心路由】：定向写入特定的 CF
             uint32_t cf_idx = GetCFIndex(cuid);
@@ -261,17 +267,18 @@ void WorkerThread(DB* db, const std::vector<ColumnFamilyHandle*>& handles, int t
             EncodeDeltaKeyInPlace(key_buf, cuid, 0);
             it->Seek(Slice(key_buf, 32));
             
-            del_batch.Clear();
+            WriteOptions del_opts;
+            del_opts.disableWAL = true;
             uint64_t count = 0;
             while (it->Valid()) {
                 if (it->key().size() < 24 || std::memcmp(it->key().data(), key_buf, 24) != 0) break;
                 
                 // 【核心路由】：针对指定的 CF 执行删除，触发 GDCT 拦截
-                del_batch.Delete(handles[cf_idx], it->key()); 
+                db->Delete(del_opts, handles[cf_idx], it->key());
                 count++; 
                 it->Next();
             }
-            db->Write(WriteOptions(), &del_batch);
+            // db->Write(WriteOptions(), &del_batch);
             
             metrics.merge_latencies.Record(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_m_start).count());
             metrics.merge_ops++;
@@ -301,11 +308,11 @@ int main() {
     ColumnFamilyOptions cf_options;
     // 【针对 16 分区的核心内存配置】
     // 将总预算均摊到 16 个区，保持每个区的 Flush 快大小适中
-    cf_options.write_buffer_size = 16 * 1024 * 1024; // 16MB per CF
-    cf_options.max_write_buffer_number = 2;
-    cf_options.level0_file_num_compaction_trigger = 8;
-    cf_options.level0_slowdown_writes_trigger = 40;
-    cf_options.level0_stop_writes_trigger = 60;
+    // cf_options.write_buffer_size = 16 * 1024 * 1024; // 16MB per CF
+    // cf_options.max_write_buffer_number = 2;
+    // cf_options.level0_file_num_compaction_trigger = 8;
+    // cf_options.level0_slowdown_writes_trigger = 40;
+    // cf_options.level0_stop_writes_trigger = 60;
     
     OptimizeOptionsForDeltaNVME(cf_options);
 

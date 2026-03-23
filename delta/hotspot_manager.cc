@@ -21,7 +21,7 @@ uint64_t HotspotManager::ExtractCUID(const Slice& key) {
          (static_cast<uint64_t>(p[6]) << 8)  | (static_cast<uint64_t>(p[7]));
 }
 
-bool HotspotManager::InterceptDelete(const Slice& key, DB* db) {
+bool HotspotManager::InterceptDelete(const Slice& key, DB* db, ColumnFamilyHandle* cfh) {
     uint64_t cuid = ExtractCUID(key);
     if (cuid == 0) return false;
 
@@ -38,7 +38,7 @@ bool HotspotManager::InterceptDelete(const Slice& key, DB* db) {
             end_ukey[16 + i] = byte;
         }
         end_ukey.append(8, '\xFF'); 
-        TaintL1Files(db, cuid, Slice(start_ukey), Slice(end_ukey));
+        TaintL1Files(db, cfh, cuid, Slice(start_ukey), Slice(end_ukey));
         return true;
     }
     return false;
@@ -122,10 +122,11 @@ double HotspotManager::GetL0FileGarbageRatio(uint64_t file_num) {
 }
 
 // === L1 Taint 污染追踪高并发实现 ===
-void HotspotManager::TaintL1Files(DB* db, uint64_t cuid, const Slice& start_user_key, const Slice& end_user_key) {
+void HotspotManager::TaintL1Files(DB* db, ColumnFamilyHandle* cfh, uint64_t cuid, const Slice& start_user_key, const Slice& end_user_key) {
     DBImpl* db_impl = static_cast<DBImpl*>(db);
     std::vector<FileMetaData*> overlaps;
-    auto cfd = db_impl->GetVersionSet()->GetColumnFamilySet()->GetDefault();
+    auto* cfh_impl = static_cast<ColumnFamilyHandleImpl*>(cfh);
+    auto cfd = cfh_impl->cfd();
     auto current_version = cfd->current();
     auto* vstorage = current_version->storage_info();
 
@@ -149,7 +150,7 @@ void HotspotManager::TaintL1Files(DB* db, uint64_t cuid, const Slice& start_user
         if (taint_ratio > 0.40) {
              Slice s = f->smallest.user_key();
              Slice e = f->largest.user_key();
-             db->SuggestCompactRange(db->DefaultColumnFamily(), &s, &e);
+             db->SuggestCompactRange(cfh, &s, &e);
              l1_file_garbage_bytes_.erase(fid); // 重置账本
              ROCKS_LOG_INFO(db->GetOptions().info_log, "[Delta-GC] Suggesting L1->L1 Purge for File %lu", fid);
         }

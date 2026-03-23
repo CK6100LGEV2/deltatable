@@ -567,23 +567,23 @@ bool LevelCompactionBuilder::PickSmartL0ToL1Compaction() {
   });
 
   // 1) Ghost drop
-  if (hotspot_manager) {
-    for (auto* f : l0_files) {
-      if (f->being_compacted) continue;
-      double garbage_ratio = hotspot_manager->GetL0FileGarbageRatio(f->fd.GetNumber());
-      if (garbage_ratio > 0.98) {
-        start_level_ = 0;
-        start_level_inputs_.level = 0;
-        start_level_inputs_.files.clear();
-        start_level_inputs_.files.push_back(f);
-        output_level_ = 0;
-        compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
-        std::cout << "[Delta-Smart] Ghost Drop for L0 File " << f->fd.GetNumber()
-                  << " (garbage=" << garbage_ratio << ")" << std::endl;
-        return true;
-      }
-    }
-  }
+  // if (hotspot_manager) {
+  //   for (auto* f : l0_files) {
+  //     if (f->being_compacted) continue;
+  //     double garbage_ratio = hotspot_manager->GetL0FileGarbageRatio(f->fd.GetNumber());
+  //     if (garbage_ratio > 0.98) {
+  //       start_level_ = 0;
+  //       start_level_inputs_.level = 0;
+  //       start_level_inputs_.files.clear();
+  //       start_level_inputs_.files.push_back(f);
+  //       output_level_ = 0;
+  //       compaction_reason_ = CompactionReason::kFilesMarkedForCompaction;
+  //       std::cout << "[Delta-Smart] Ghost Drop for L0 File " << f->fd.GetNumber()
+  //                 << " (garbage=" << garbage_ratio << ")" << std::endl;
+  //       return true;
+  //     }
+  //   }
+  // }
 
   // If not yet over trigger, skip smart heavy logic
   if (total_files < static_cast<size_t>(compaction_trigger)) {
